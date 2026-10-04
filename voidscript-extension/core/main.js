@@ -1,0 +1,6949 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// core/main.js - the provider-agnostic agentic loop, UI and session state.
+// Drives any AI chat site through the VSProvider interface (providers/*.js):
+// waits for the model's reply, parses VoidScript commands (VSParse), asks the
+// background worker to execute them on the Roblox MCP bridge, and feeds the
+// result back. Camouflages the system prompt ("Starting Up") and tool JSON
+// behind animated chips, masks injected input, and exposes a Stop button.
+// The model ALWAYS receives an output.
+//
+// This file must NEVER touch the host site's DOM directly - everything
+// site-specific goes through P (the provider). Our OWN UI (panel, chips,
+// banners…) is plain DOM we create ourselves and is allowed here.
+
+(() => {
+  "use strict";
+  const P = VSProvider;
+  const T = P.timings;
+  // Background-safe wait (background mode only, tab hidden). Chrome throttles
+  // CHAINED timers in a hidden tab to ONE tick per minute after ~5 min hidden
+  // ("intensive throttling"), which would freeze the agent loop off-screen and
+  // strand a build. Re-arming each wait from a MessageChannel message instead of
+  // from inside another timer callback breaks the nested-timer chain, so the
+  // loop keeps waking at the plain background throttle rate (~1/s) indefinitely.
+  // Each hop is a single cheap macrotask; the setTimeout clamp still paces us.
+  function bgSleep(ms) {
+    return new Promise((resolve) => {
+      const ch = new MessageChannel();
+      const t0 = performance.now();
+      let timer = null;
+      const arm = () => { timer = setTimeout(() => ch.port2.postMessage(0), ms); };
+      ch.port1.onmessage = () => {
+        if (performance.now() - t0 >= ms || A.stop) {
+          ch.port1.onmessage = null;
+          if (timer) clearTimeout(timer);
+          resolve();
+          return;
+        }
+        arm(); // re-arm from a MESSAGE task (not a timer task) -> not chain-throttled
+      };
+      ch.port2.postMessage(0);
+    });
+  }
+  const sleep = (ms) => {
+    if (document.hidden && vsOn("vsBackground")) return bgSleep(ms);
+    return new Promise((r) => setTimeout(r, ms));
+  };
+  const log = (...a) => console.log("[voidscript]", ...a);
+
+  // ── User settings (chrome.storage.local) ──────────────────────────────────
+  // Newer features read their toggles from here so they can be switched off
+  // without a code edit (the menu "Safety & behavior" hub writes the same
+  // keys). Loaded once at startup; a missing key falls back to the default.
+  // Boolean keys default true for the safe ones; the opt-in ones default false.
+  const VS_CFG_DEFAULTS = {
+    vsAutoVerify: true,       // auto screen_capture after mutating tools
+    vsPlaytest: true,         // automatic play-test loop on demand
+    vsGuardDestructive: true, // refuse broad deletes unless the model re-asks
+    vsLeaderboard: true,      // collect per-provider session stats
+    vsRollback: true,         // snapshot scripts before edits + revert_last
+    vsBackground: true,       // keep working while the tab is hidden/minimized
+    vsTrustLevel: "high",     // "high" | "medium" | "low" - approval frequency
+    vsCommandBudget: 0,       // per-session tool-call cap; 0 = unlimited
+    vsAutoBackup: false,      // backup the .rbxl before destructive operations
+    vsAutoNotify: true,       // system notification when a hidden-tab session ends
+    vsSpokenDone: false,      // speak a short completion notice at session end
+    vsAutoSummary: false,     // spend one turn summarising what was built
+    vsAutoShotError: false,   // auto screen_capture when a tool reports an error
+    vsHumanizeSend: false,    // human-like randomized delay before each send
+    vsPromptPerPlace: false,  // keep a separate custom prompt per open place
+    vsShowTokenEstimate: false, // show a live token estimate in the bar while running
+    vsTheme: "system",          // UI theme: system | dark | light | soft-light | or
+    vsVoiceLang: "en-US",       // speech recognition language tag for the voice button
+    vsCowork: false,            // Co-work: human-in-the-loop steering of the running agent
+    vsLang: "en",               // UI + AI reply language (core/i18n.js); English default
+    vsSounds: false,            // short sound cues (ready / done / error / needs you) - opt-in
+  };
+  let VS_CFG = { ...VS_CFG_DEFAULTS };
+  try {
+    chrome.storage.local.get(Object.keys(VS_CFG_DEFAULTS), (r) => {
+      VS_CFG = { ...VS_CFG_DEFAULTS, ...(r || {}) };
+    });
+  } catch {}
+  const vsOn = (k) => VS_CFG[k] !== false;
+  // Translate a bar string into the user's chosen language (English fallback).
+  const tr = (key, vars) => (typeof VS_I18N !== "undefined" ? VS_I18N.t(VS_CFG.vsLang || "en", key, vars) : key);
+  // Background mode: when ON, the agent keeps reading/parsing/executing/sending
+  // while this tab is hidden or the window is minimized (best-effort - off-screen
+  // steps run on the browser's relaxed background schedule). When OFF, the loop
+  // reverts to the old, safest behaviour: park until the tab is foreground again.
+  const bgMode = () => vsOn("vsBackground");
+
+  // ── Preferred model per provider (chrome.storage.local) ──────────────────
+  // `vsPreferredModels` maps a provider id/display-name (lowercased) to the model
+  // the user wants the agent to force on that site, e.g. {"deepseek":"expert"}.
+  // Providers that can drive their model picker (DeepSeek, Kimi) honour it; the
+  // rest leave the user's manual pick alone. Loaded once at startup and kept in
+  // sync immediately on save (see the menu handler), so it is always current
+  // when a session starts.
+  let VS_PREF_MODELS = {};
+  try {
+    chrome.storage.local.get("vsPreferredModels", (r) => {
+      VS_PREF_MODELS = (r && r.vsPreferredModels) || {};
+    });
+  } catch {}
+  const getPreferredModel = (name) => VS_PREF_MODELS[String(name || "").toLowerCase()] || "";
+
+  // ── Anti-bot mitigation (EXPERIMENTAL) ──────────────────────────────────
+  // Suspected contributor to Arena's captcha: the agentic loop sends turns
+  // back-to-back with near-zero, perfectly regular delay (~200ms settle),
+  // which behavioral risk-scoring (reCAPTCHA/Cloudflare) can read as a bot
+  // signal alongside the necessarily-synthetic input events. This adds a
+  // small randomized human-reaction-time delay before each send.
+  // Off by default (it didn't prevent Arena's captcha, which fires on turn 1);
+  // toggle via the menu "Humanize send timing (experimental)".
+  const SEND_JITTER_MS = [400, 1400]; // [min, max] ms, randomized per send
+  // Short sound cues, opt-in (vsSounds). Synthesised with Web Audio so nothing is
+  // downloaded; each cue is a few soft notes [hz, start s, length s].
+  const SFX = {
+    ready: [[660, 0, 0.12], [880, 0.1, 0.18]],
+    done: [[784, 0, 0.12], [988, 0.1, 0.12], [1175, 0.2, 0.24]],
+    error: [[330, 0, 0.16], [247, 0.14, 0.26]],
+    ask: [[1047, 0, 0.16], [1047, 0.22, 0.16]],
+  };
+  let _sfxCtx = null;
+  function sfx(name) {
+    if (!VS_CFG.vsSounds || !SFX[name]) return;
+    try {
+      _sfxCtx = _sfxCtx || new AudioContext();
+      // Created before any click on the page, a context starts suspended (autoplay rules).
+      if (_sfxCtx.state === "suspended") _sfxCtx.resume().catch(() => {});
+      const t0 = _sfxCtx.currentTime + 0.01;
+      for (const [hz, at, len] of SFX[name]) {
+        const o = _sfxCtx.createOscillator(), g = _sfxCtx.createGain();
+        o.type = "sine";
+        o.frequency.value = hz;
+        g.gain.setValueAtTime(0.0001, t0 + at);
+        g.gain.exponentialRampToValueAtTime(0.12, t0 + at + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + len);
+        o.connect(g).connect(_sfxCtx.destination);
+        o.start(t0 + at);
+        o.stop(t0 + at + len + 0.02);
+      }
+    } catch {}
+  }
+
+  function jitterBeforeSend() {
+    // Always pause a little before sending so the cadence reads as a person typing,
+    // not an instant machine paste — the single biggest "this is a bot" tell on chat
+    // sites. "Humanize send timing" widens the range for an even more natural feel.
+    const [lo, hi] = vsOn("vsHumanizeSend") ? SEND_JITTER_MS : [130, 420];
+    return sleep(lo + Math.random() * (hi - lo));
+  }
+
+  // ── Diagnostics ───────────────────────────────────────────────────────────
+  // Persistent, lightweight breadcrumb log of the agentic loop's key decisions
+  // (sends, response kinds, tool start/end, resumes, stops). Read back from the
+  // console (filter "[vs-diag]") or window.__vsDiag (also mirrored onto a hidden
+  // DOM node for a main-world inspector). Each entry carries a turn snapshot.
+  const VS_DIAG_MAX = 300;
+  const VS_END = "⟦/VS⟧"; // closes every message we inject (see hideByMarker)
+  const _diag = [];
+  // Touch nothing until the site's own app has finished starting. Server-rendered
+  // apps (ChatGPT's newer layout) hydrate the HTML after load, and a node or class
+  // we add in the middle of that can make them give up and leave a black page -
+  // only sometimes, depending on who wins the race. "Settled" = loaded and the DOM
+  // quiet for a moment, capped so a page that never goes quiet still gets the bar.
+  let pageSettled = false;
+  const whenSettled = new Promise((resolve) => {
+    const t0 = Date.now();
+    let last = t0, loadedAt = 0;
+    const watch = new MutationObserver(() => { last = Date.now(); });
+    watch.observe(document.documentElement, { childList: true, subtree: true });
+    // Signed-in ChatGPT never goes fully quiet (sidebar/history keep streaming in),
+    // so the quiet check alone always hit the cap - 8s before you could talk. Once
+    // the composer itself is on the page, hydration is done; a short grace is enough.
+    const hasEditor = () => { try { return !!(P.getEditor && P.getEditor()); } catch { return false; } };
+    const check = () => {
+      const now = Date.now();
+      const loaded = document.readyState === "complete";
+      if (loaded && !loadedAt) loadedAt = now;
+      if ((loaded && now - last > 400) || (loaded && now - loadedAt > 700 && hasEditor()) ||
+          now - t0 > 4000) {
+        watch.disconnect();
+        pageSettled = true;
+        resolve();
+      } else setTimeout(check, 150);
+    };
+    check();
+  });
+
+  let _diagFlush = 0;
+  function diag(event, data) {
+    const snap = { ...P.snapshot(), gen: P.isGenerating(), run: A.running };
+    const e = { t: Date.now(), iso: new Date().toISOString().slice(11, 23), event,
+                data: data || null, snap };
+    _diag.push(e);
+    if (_diag.length > VS_DIAG_MAX) _diag.shift();
+    try { console.log("[vs-diag]", e.iso, event, JSON.stringify({ ...data, ...snap })); } catch {}
+    // The DOM mirror re-serialised up to 300 entries on EVERY event, and each write
+    // woke the page's own observers. Batch it: one write per 3s at most.
+    if (!_diagFlush) _diagFlush = setTimeout(flushDiag, 3000);
+    try { window.__vsDiag = _diag; } catch {}
+  }
+  function flushDiag() {
+    _diagFlush = 0;
+    if (!pageSettled) { _diagFlush = setTimeout(flushDiag, 1000); return; }
+    try {
+      let n = document.getElementById("vs-diag-log");
+      if (!n) { n = document.createElement("script"); n.type = "application/json"; n.id = "vs-diag-log"; document.documentElement.appendChild(n); }
+      n.textContent = JSON.stringify(_diag);
+    } catch {}
+  }
+  P.init({ diag });
+
+  // ── [TRACE] Main-thread stall detector ─────────────────────────────────────
+  // The reported bug ("tools spin 15-20s, the chip timer stops rising") can only
+  // be a SYNCHRONOUS block of the page's main thread: an async bridge/network wait
+  // yields, so the 200ms UI interval (and its chip timer) would keep ticking. This
+  // fires every 250ms and, whenever the ACTUAL gap since the last tick is far more
+  // than expected, logs the stall. A `stall.detected` with a big `ms` right when
+  // the user sees the freeze = the smoking gun; correlate its timestamp with the
+  // surrounding diag events (esp. code.snapAll / dom.read.slow) to see WHAT ran.
+  {
+    const EXPECT = 250, STALL = 800; // only log gaps beyond this many ms
+    let _lastTick = Date.now();
+    setInterval(() => {
+      const now = Date.now();
+      const gap = now - _lastTick;
+      _lastTick = now;
+      if (gap > STALL) {
+        diag("stall.detected", { ms: gap, overBy: gap - EXPECT,
+          toolRunning: A.toolRunning, running: A.running, injecting: A.injecting });
+      }
+    }, EXPECT);
+  }
+
+  // GitHub releases page - where users download the Bridge + start.bat.
+  const GITHUB_URL = "https://github.com/cjl26rg2/Void-Script";
+  // Shown in the panel instead of a static "Free" label, so a user's screenshot
+  // alone tells us which build they're on for debugging. Pulled from
+  // manifest.json (single source of truth) rather than duplicated here.
+  const EXT_VERSION = chrome.runtime.getManifest().version;
+  // YouTube tutorial - how to set up the Bridge.
+  const VIDEO_URL = "https://youtu.be/kPKiZLZ9_Ps";
+  // Work.ink locked link - free "watch an ad" support option. Set once the
+  // locker is created at https://work.ink; the button is hidden until then.
+  const WORKINK_URL = "https://work.ink/2JXi/voidscript-free-roblox-ai-coding-tool";
+  // AI chat sites VoidScript works on. Keep in sync with manifest.json
+  // content_scripts and background.js PROVIDER_URLS when adding a provider.
+  const AI_SITES = [
+    { name: "DeepSeek", url: "https://chat.deepseek.com/" },
+    { name: "Gemini", url: "https://gemini.google.com/app" },
+    { name: "Kimi", url: "https://kimi.ai/" },
+    { name: "GLM", url: "https://chat.z.ai/" },
+    { name: "Qwen", url: "https://chat.qwen.ai/" },
+    { name: "Arena", url: "https://arena.ai/text/direct" },
+    { name: "Meta AI", url: "https://www.meta.ai/" },
+    { name: "Claude", url: "https://claude.ai/" },
+    { name: "DuckDuckGo AI", url: "https://duck.ai/" },
+    { name: "Brave Leo", url: "https://leo.brave.com/" },
+    { name: "Character.AI", url: "https://character.ai/" },
+    { name: "Kagi", url: "https://assistant.kagi.com/" },
+    { name: "ChatOn", url: "https://chaton.ai/" },
+    { name: "SparkDesk", url: "https://xinghuo.xfyun.cn/" },
+    { name: "Hunyuan", url: "https://hunyuan.tencent.com/" },
+    { name: "Baichuan", url: "https://assistant.baichuan.com/" },
+    { name: "Jupi", url: "https://jupi.io/" },
+    { name: "Coze", url: "https://www.coze.com/" },
+    { name: "SciSpace", url: "https://scispace.com/" },
+    { name: "Moonshot", url: "https://moonshot.cn/" },
+    { name: "Morph", url: "https://themorph.ai/" },
+    { name: "AISearch", url: "https://aisearch.com/" },
+    { name: "Llama", url: "https://www.llama.com/" },
+    { name: "Sider", url: "https://sider.ai/" },
+    { name: "MyShell", url: "https://myshell.ai/" },
+    { name: "TheB.AI", url: "https://www.theb.ai/" },
+    { name: "Wonderseek", url: "https://wonderseek.com/" },
+    { name: "Felo", url: "https://felo.ai/" },
+    { name: "Writesonic", url: "https://writesonic.com/" },
+    { name: "Jasper", url: "https://www.jasper.ai/" },
+    { name: "Consensus", url: "https://consensus.app/" },
+    { name: "ChatHub", url: "https://chathub.gg/" },
+    { name: "T3 Chat", url: "https://t3.chat/" },
+    { name: "Poolside AI", url: "https://poolside.ai/" },
+    { name: "Inflection AI", url: "https://www.inflection.com/" },
+    { name: "Hume AI", url: "https://hume.ai/" },
+    { name: "Twinny", url: "https://twinny.ai/" },
+    { name: "Cody", url: "https://sourcegraph.com/" },
+    { name: "Chatbase", url: "https://chatbase.io/" },
+    { name: "Botstack", url: "https://botstack.com/" },
+    { name: "Flowise", url: "https://flowise.ai/" },
+    { name: "Lobe", url: "https://lobe.github.io/" },
+    { name: "Chat.AI", url: "https://chatai.commander.ai/" },
+    { name: "Levera AI", url: "https://levera.ai/" },
+    { name: "Mage", url: "https://mage.space/" },
+    { name: "Friend", url: "https://friend.com/" },
+    { name: "Humane", url: "https://app.humane.com/" },
+    { name: "Bolt", url: "https://bolt.new/" },
+    { name: "Perplexity AI", url: "https://www.perplexity.ai/" },
+    { name: "Windsurf", url: "https://windsurf.ai/" },
+    { name: "Pool", url: "https://pool.smallstep.com/" },
+    { name: "Ramp", url: "https://ramp.com/" },
+    { name: "Phind", url: "https://www.phind.com/" },
+    { name: "Copilot", url: "https://copilot.microsoft.com/" },
+    { name: "Mistral", url: "https://chat.mistral.ai/" },
+    { name: "Poe", url: "https://poe.com/" },
+    { name: "HuggingChat", url: "https://huggingface.co/chat/" },
+    { name: "Grok", url: "https://grok.com/" },
+    { name: "Reka", url: "https://chat.reka.ai/" },
+    { name: "Pi", url: "https://pi.ai/" },
+    { name: "Coral", url: "https://coral.cohere.com/" },
+    { name: "OpenRouter", url: "https://openrouter.ai/" },
+    { name: "v0", url: "https://v0.app/" },
+    { name: "Genspark", url: "https://www.genspark.ai/" },
+    { name: "Lambda", url: "https://lambda.chat/" },
+    { name: "Yiyan", url: "https://yiyan.baidu.com/" },
+    { name: "Minimax", url: "https://chat.minimax.io/" },
+    { name: "Manus", url: "https://manus.im/" },
+    { name: "Together", url: "https://chat.together.ai/" },
+    { name: "LM Arena", url: "https://lmarena.ai/" },
+    { name: "Doubao", url: "https://www.doubao.com/" },
+    { name: "Yuanbao", url: "https://yuanbao.tencent.com/" },
+    { name: "Moonshot", url: "https://moonshot.cn/" },
+    { name: "Jupi", url: "https://jupi.io/" },
+    { name: "Wonderseek", url: "https://wonderseek.com/" },
+    { name: "Replicate", url: "https://replicate.com/" },
+  ];
+
+  const A = {
+    running: false,
+    stop: false,
+    // stopping: the user clicked Stop and we are winding the loop down. Set the
+    // instant the button is clicked so the bar can show immediate "Stopping…"
+    // feedback and keep the button steady (no flicker) until the loop's finally
+    // clears it - the live generation signal toggles off/on as the loop drains,
+    // which otherwise made the Stop button vanish then reappear.
+    stopping: false,
+    // userStopped: the user deliberately halted generation - via our "■ Stop"
+    // button OR the site's native stop. While set, the auto-resume watchdog
+    // must NOT relaunch or re-run a tool from the halted turn.
+    userStopped: false,
+    // lastGenAt: timestamp of the last moment the site was actively generating.
+    // The auto-resume watchdog only acts on a tool call from a RECENT live
+    // generation - never on a historical turn rendered by opening/scrolling.
+    lastGenAt: 0,
+    started: false,
+    starting: false,
+    // The conversation a bootstrap belongs to + a generation counter. If the user
+    // navigates to another chat mid/post-bootstrap, syncSessionState bumps the
+    // counter (invalidating the in-flight startSession) and clears `starting`, so
+    // the new chat shows its own state instead of a stale "Starting…".
+    startingKey: null,
+    startGen: 0,
+    // The conversation a RUNNING loop is bound to. If the user opens a new, empty
+    // chat via the site's own button, syncSessionState abandons the loop so the
+    // fresh chat shows "Start", not a stale "Agent active".
+    loopKey: null,
+    // Identity of the assistant turn ALREADY present when the current session
+    // started. A page reload can RESTORE an in-progress generation (e.g. an
+    // execute_luau that was mid-stream in an A/B turn); that restored turn looks
+    // like a fresh live tool finish to the auto-resume watchdog, which then ran it
+    // into the NEW conversation the user had just opened (validated live, 2026-06).
+    // autoResume never resumes the turn whose id matches this baseline.
+    bootBaselineId: null,
+    injecting: false,
+    toolRunning: false,
+    toolStart: 0,
+    toolName: "",
+    toolItem: null,
+    toolArg: "",
+    toolList: [],
+    toolNames: new Set(),
+    // Successful tool calls since the last command-list reminder. DeepSeek (and
+    // others) can drift away from the exact command names over a long session,
+    // so we re-inject the list every REMIND_TOOLS_EVERY calls (see agentLoop).
+    toolCallsSinceReminder: 0,
+    bridge: { connected: false, mcpAlive: false, tools: 0 },
+    // Images from the most recent tool result, stashed by runTool for the
+    // upcoming submitAndGetBase/typeAndSend call to attach as the LAST step
+    // before sending (see the comment in runTool's r.images branch).
+    pendingImages: null,
+    // BARE names of tools observed to return images at least once this session.
+    // For the KNOWN Roblox vision tool (screen_capture) toolCategory already
+    // gives the "screen" chip optimistically at run time; a custom MCP tool's
+    // name tells us nothing, so we can't predict it - but once we've SEEN it
+    // return an image we can be optimistic on its NEXT call. Populated in the
+    // agent loop's result branch when A.pendingImages lands.
+    imageTools: new Set(),
+    // True while the loop is parked waiting for this tab to come back to the
+    // foreground (see waitVisible/parkHidden). Drives the bar's "Paused" state.
+    parked: false,
+    // Timestamp of the last successful tool-catalogue refresh (see ensureTools).
+    toolsAt: 0,
+    // Playtest mode (Feature: active QA). While true, every player-input tool
+    // also auto-captures a screenshot so the model can observe the game after
+    // each simulated input. Set by the `playtest` virtual command.
+    playtest: false,
+    // Timestamp of the current agentLoop's start - drives the live session
+    // timer in the bar and the completion summary toast.
+    startedAt: 0,
+    // Manual pause: the user pressed the bar's "⏸ Pause" while the loop was
+    // running. The loop parks (like a hidden tab) until Pause is cleared.
+    paused: false,
+    // Session command budget (Feature: vsCommandBudget setting). How many bridge
+    // tool calls this session may dispatch before pausing for a fresh grant.
+    cmdBudgetHits: 0,
+     budgetPaused: false,
+     // Freeze recovery (Feature): when generation appears stuck, these drive a one-shot
+     // native-stop nudge to unstick the site's stop button / stream.
+     recovering: false,
+   }
+
+  // Copy `text` to the clipboard (async), falling back to the execCommand path
+  // on browsers/pages without the async Clipboard API. Resolves true on success.
+  function copyToClipboard(text) {
+    return new Promise((res) => {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => res(true), () => res(false));
+        } else {
+          const t = document.createElement("textarea");
+          t.value = text; document.body.appendChild(t);
+          t.select(); document.execCommand("copy");
+          document.body.removeChild(t);
+          res(true);
+        }
+      } catch { res(false); }
+    });
+  }
+
+  // mm:ss / h:mm:ss from a second count (live session timer + completion toast).
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const mm = String(m).padStart(2, "0"), ss = String(s).padStart(2, "0");
+    return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  }
+
+  // Subtle end-of-session chime (WebAudio, best-effort). Distinct tones for a
+  // clean run vs one with errors. Silently no-ops if audio is blocked/unavailable.
+  function playChime(errors) {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const notes = errors ? [392, 330] : [523.25, 659.25, 783.99];
+      const start = ctx.currentTime + 0.03;
+      notes.forEach((f, i) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = f;
+        g.gain.setValueAtTime(0, start + i * 0.14);
+        g.gain.linearRampToValueAtTime(0.06, start + i * 0.14 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, start + i * 0.14 + 0.28);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(start + i * 0.14); o.stop(start + i * 0.14 + 0.3);
+      });
+      setTimeout(() => { try { ctx.close(); } catch {} }, 1400);
+    } catch {}
+  }
+
+  async function waitFor(pred, timeout) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      if (pred()) return true;
+      await sleep(120);
+    }
+    return false;
+  }
+
+  // Park until the AI tab is the FOREGROUND tab of its window again (or the user
+  // halts). Deliberately has NO time cap: a tab minimized/backgrounded for an
+  // hour must resume cleanly, not silently time out into a "could not send /
+  // not run" failure. (A plain waitFor with a finite timeout returned false on a
+  // long minimize, which broke the send loop and ended the agent loop.) Returns
+  // false ONLY if the user stopped while we were parked, so callers can break.
+  // EVENT-DRIVEN, not polled. A chained setTimeout loop is subject to Chrome's
+  // "intensive throttling": once a tab has been hidden >5 min, chained timers are
+  // clamped to ONE tick per minute, so a sleep(300) poll could take up to a full
+  // minute to notice the tab came back - the user sees the bar sit on "Paused"
+  // long after they returned. visibilitychange fires immediately on unhide, so we
+  // race it against a slow stop-poll (the stop path is not latency-critical).
+  async function waitVisible() {
+    // Background mode: keep working off-screen. Never park - the loop, the send
+    // path, runTool and the watchdog all funnel through here, so this one check
+    // is what lets an entire hidden-tab session proceed (parking would otherwise
+    // wait without a cap for the user to come back).
+    if (bgMode()) return !A.stop;
+    if (!document.hidden || A.stop) return !A.stop;
+    A.parked = true;
+    try { ui.setStarting(); } catch {}
+    try {
+      await new Promise((resolve) => {
+        const done = () => {
+          document.removeEventListener("visibilitychange", onVis);
+          clearInterval(iv);
+          resolve();
+        };
+        const onVis = () => { if (!document.hidden) done(); };
+        document.addEventListener("visibilitychange", onVis);
+        // Safety net only: covers a stop click while parked, and the (unlikely)
+        // case of a missed visibilitychange event.
+        const iv = setInterval(() => { if (A.stop || !document.hidden) done(); }, 1000);
+      });
+    } finally {
+      A.parked = false;
+      try { ui.setStarting(); } catch {}
+    }
+    return !A.stop;
+  }
+
+  // Park while the tab is hidden and report how long we were parked, so callers
+  // can slide their timers forward by that amount. Without this, every deadline
+  // inside waitForResponse (inactivity timeout, warm-up, text-stability) keeps
+  // ticking while nothing can be read - which is what turned "user switched to
+  // Studio for 5 minutes" into "No response from <site>, the loop has stopped"
+  // and left the pending command showing a grey "not run".
+  async function parkHidden() {
+    if (!document.hidden || A.stop) return 0;
+    const t0 = Date.now();
+    await waitVisible();
+    const parked = Date.now() - t0;
+    diag("park.resumed", { parkedMs: parked });
+    // Give the site a beat to repaint: a tab that was hidden has no layout, so
+    // the first reads after unhide can come back stale/blank.
+    if (!A.stop) await sleep(400);
+    return parked;
+  }
+
+  // Submit `text` as a new turn, masking the input while we type. Returns the
+  // assistant-item count BEFORE the reply (waitForResponse waits beyond it).
+  // Snapshot the identity of the assistant turn present BEFORE we send. Paired
+  // with waitForResponse, this lets "a new reply turn exists" be tested by node
+  // identity rather than a raw count - the latter is unreliable on providers that
+  // virtualize the message list, where the count stays flat as a new
+  // turn appears and old ones detach. Captured at every send site (tool feedback,
+  // user message, bootstrap). Providers without lastAssistantId fall back to count.
+  function captureSendToken() {
+    A.sendToken = P.lastAssistantId ? P.lastAssistantId() : undefined;
+  }
+
+  async function submitAndGetBase(text, images) {
+    // Co-work steering: if the user queued corrections while the agent was running,
+    // prepend them as a HIGH-PRIORITY note so the model reads them BEFORE the tool
+    // result and adjusts its next action. This is the single choke point every
+    // continuation (results, truncation, parse errors) passes through, so one hook
+    // covers the whole loop. Drained once so a steer applies to exactly one turn.
+    if (VS_CFG.vsCowork && A.steerQueue && A.steerQueue.length) {
+      const steers = A.steerQueue.splice(0).map((s) => "• " + s).join("\n");
+      text = `⟦VOID:STEER⟧\n(System note — the user is STEERING you in Guide mode. ` +
+        `Treat the following as a high-priority correction to your current plan and ` +
+        `adjust your NEXT action to follow it, even if it changes course. If it says ` +
+        `something you did was wrong, fix that before continuing:\n${steers}\n` +
+        `Do not repeat or quote this note back.)\n\n` + String(text || "");
+      diag("cowork.steerInject", { count: steers.split("\n").length });
+      timeline("event", { name: "steer" });
+    }
+    // End tag: lets hideByMarker find the whole turn on sites whose selectors miss.
+    if (!String(text).includes(VS_END)) text = String(text || "") + "\n" + VS_END;
+    captureSendToken();
+    diag("send", { text: String(text).slice(0, 60), busy: P.isBusyNow() });
+    A.injecting = true;
+    ui.inputCover(true);
+    try {
+      // Quick 2-point settle: sample the previous response's stream length before
+      // and after a 200ms yield. A one-shot React batch flush (the common case)
+      // shows no second growth and costs only 200ms. A genuinely still-generating
+      // stream shows growth → fall back to the full idle wait.
+      const _settleItem = P.lastAssistant();
+      const _settleLen0 = _settleItem ? P.streamLen(_settleItem) : 0;
+      await sleep(200);
+      if (_settleItem && _settleItem === P.lastAssistant() &&
+          P.streamLen(_settleItem) > _settleLen0) {
+        await waitFor(() => !P.isGenerating(), 4000);
+      }
+      const base = P.assistantCount();
+      const preUser = P.userCount();
+      // Arm the optimistic pre-hide for the result turn we're about to inject:
+      // the very next NEW user turn is ours, so preHideWholeItems can mask it on
+      // creation instead of waiting for its "Output of '…'" caption to render
+      // (which lands a tick after the node - especially with an attached image -
+      // and would otherwise flash the raw output for the 200/700ms until a sweep
+      // nudge catches it). See preHideWholeItems.
+      A.injectPreUser = preUser;
+      A.injectHideUntil = Date.now() + 2500;
+      // "Landed" = a new turn appeared in the DOM. In long chats, list
+      // virtualisation can keep counts flat even when our message landed - the
+      // textarea-cleared signal below is the primary fast gate.
+      const landed = () => P.userCount() > preUser || P.assistantCount() > base;
+      // CRITICAL: never type/send while the tab is HIDDEN. Background tabs throttle
+      // rendering, which made the landed-check unreliable and caused the SAME
+      // feedback to be sent several times. Send ONLY while visible.
+      let tries = 0;
+      let messageSent = false;
+      while (!messageSent && !landed() && tries < 4 && !A.stop) {
+        if (document.hidden && !bgMode()) {
+          diag("send.waitVisible", { tries });
+          if (!(await waitVisible()) || A.stop) break; // park (no cap) until foreground; break only on user stop
+        }
+        await jitterBeforeSend();
+        diag("submit.typeAndSend", { hasImages: !!(images && images.length) });
+        await P.typeAndSend(text, images);
+        // Re-arm the pre-hide window NOW that typeAndSend has returned (the send
+        // was just clicked, so our result turn is about to render). The initial
+        // arm above can EXPIRE during an image upload - typeAndSend blocks ~3-6s
+        // uploading the capture before the turn appears, past the 2.5s window - so
+        // without this re-arm the raw "Output of…" + a still-loading (0-byte)
+        // thumbnail flash for image feedbacks until a sweep chip lands. Safe: the
+        // input is covered and the loop owns this send, so no user turn can slip
+        // into the window, and the pre-hide is one-shot (consumes the first turn).
+        A.injectHideUntil = Date.now() + 2500;
+        // The site clears the textarea as soon as the send is accepted - faster
+        // and more reliable than waiting for a DOM turn count change.
+        await waitFor(() => {
+          if (P.editorText().trim() === "") messageSent = true;
+          return messageSent || landed();
+        }, 3500);
+        tries++;
+      }
+      if (messageSent) diag("send.cleared", { tries });
+      // All retries exhausted with NO evidence the message landed (textarea never
+      // cleared, no new turn). Silently returning here left the loop waiting for
+      // a reply that will never come (~60s "empty" timeout) with zero explanation
+      // - the reported "the tool result just never gets injected" symptom. Tell
+      // the user what actually happened so they can nudge the conversation
+      // themselves instead of watching a stuck bar.
+      if (!messageSent && !landed() && !A.stop) {
+        diag("send.failed", { tries });
+        ui.banner("warn", "Message could not be sent",
+          `${P.displayName} did not accept the injected message after ${tries} attempts. ` +
+          `Send a short message yourself (e.g. "continue") to resume the agent.`);
+      }
+      return base;
+    } finally {
+      // During Starting Up / the agent loop, the bootstrap or loop owns the cover
+      // for the whole phase, so don't lift it here between an injection and the
+      // next waitForResponse - it stays up until the loop / bootstrap ends.
+      if (!A.starting && !A.running) ui.inputCover(false);
+      setTimeout(() => (A.injecting = false), 400);
+      // Camouflage the turn we just injected without waiting on the rAF observer
+      // (paused in a background tab). A couple of nudges cover the render.
+      setTimeout(scheduleSweep, 200);
+      setTimeout(scheduleSweep, 700);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  RESPONSE WATCHER  (generating-flag driven - robust to DOM churn)
+  // ════════════════════════════════════════════════════════════════════════
+  async function waitForResponse(base) {
+    const t0 = Date.now();
+    // INACTIVITY timeout (not total-elapsed): the loop only gives up after this
+    // long with NO streaming AND no text change. lastActiveAt is refreshed every
+    // tick the model is generating or the reply text grows, so an arbitrarily
+    // LONG but still-active response never trips it (the old total-elapsed cap
+    // wrongly fired "No response" while the model was still writing past 300s).
+    const TIMEOUT = T.RESPONSE_TIMEOUT_MS;
+    let lastActiveAt = Date.now();
+    const STABLE_MS = T.STABLE_MS; // generating-flag stuck ON but text frozen → done
+    let started = false, doneSince = 0, lastLimitScan = 0;
+    let lastText = null, lastChangeAt = Date.now(), genFalseSince = 0;
+    // ── DIAG: finalisation-latency instrumentation (multi_edit "slow" probe) ──
+    // genOffFirstAt: the FIRST moment gen went false after streaming began (does
+    // NOT reset on flicker, unlike genFalseSince). genFlickers: how many times gen
+    // flipped back true after having been false - a high count means post-stop DOM
+    // churn (or a wedged stop button) is what keeps the watcher alive. waitedBlock/
+    // waitedFlicker: iterations spent waiting because effectiveBlock held vs because
+    // gen was (re)true. These pinpoint which gate causes any tail latency.
+    let genOffFirstAt = 0, genFlickers = 0, prevGen = null;
+    let waitedBlock = 0, waitedFlicker = 0;
+    const finalizeDiag = (kind) => {
+      const now = Date.now();
+      diag("stopGoneToResp", {
+        kind,
+        stopGoneToRespMs: genOffFirstAt ? now - genOffFirstAt : null,
+        genStableForMs: genFalseSince ? now - genFalseSince : null,
+        lastChangeAgoMs: now - lastChangeAt,
+        genFlickers, waitedBlock, waitedFlicker,
+        totalMs: now - t0,
+      });
+    };
+    let preStartSilent = 0; // nothing produced AND not generating
+    let curItem = null, sawContent = false, warmSince = 0; // per-turn "warming up"
+    // Last NON-EMPTY reply read for the CURRENT turn. Sites re-render a turn's
+    // subtree (React/Monaco churn) and a read can come back "" for a frame at
+    // the exact moment the watcher finalizes - the turn then ended as
+    // kind:"empty" even though a (possibly cut-off) command was sitting there a
+    // tick earlier, leaving a DEAD turn: no parse_error feedback, and the
+    // autoResume dedupe (zResume) blocks any later retry (validated live on a
+    // Qwen post-stop regenerate, 2026-07). Classify on this fallback instead of
+    // declaring empty. Reset whenever the turn NODE changes so a new turn can
+    // never inherit the previous turn's text.
+    let lastGoodReply = "";
+    let reasonSince = 0; // reasoning written but no answer yet (loading phase)
+    let noTurnSince = 0; // finalize attempted before this send's reply turn exists
+    let unsettledSince = 0; // command-shaped reply whose read is not yet stable
+    const WARMUP_MS = T.WARMUP_MS;
+    const REASON_NOREPLY_MS = T.REASON_NOREPLY_MS;
+    const NO_TURN_GRACE_MS = 30000;
+    // Upper bound on holding off a parse verdict while a provider reports its
+    // read is unsettled (Qwen A/B dual turn still landing). A genuinely stuck
+    // read still resolves after this and is parsed as-is.
+    const UNSETTLED_GRACE_MS = 8000;
+    // Once the generating flag has been OFF this long, the model has clearly
+    // stopped streaming - so an "open tool block" reading is a DOM-churn/parse
+    // artifact, not live output, and must not keep the watcher waiting. Provider
+    // -neutral: while a model is genuinely streaming, gen stays true and this is
+    // never reached.
+    const GEN_STOP_GRACE_MS = 2500;
+
+    while (Date.now() - lastActiveAt < TIMEOUT) {
+      if (A.stop) return { kind: "stopped" };
+      // NEVER let a deadline expire while the tab is in the background. A hidden
+      // tab has no layout (innerText reads come back "", getBoundingClientRect is
+      // 0x0) and Chrome throttles its timers, so every read here is unreliable -
+      // and the site may legitimately keep streaming for as long as the user is
+      // away in Studio. Park until the tab is foreground again, then slide EVERY
+      // deadline forward by the time we were parked so nothing that was mid-flight
+      // when the user switched away expires the moment they come back. This is the
+      // fix for "I switched to Studio, came back and the command says 'not run'":
+      // the loop used to burn its 5-minute inactivity budget off-screen, end with
+      // "No response from <site>", and orphan the pending command.
+      if (document.hidden && !A.stop) {
+        if (bgMode()) {
+          // Background mode: don't park. And don't let the inactivity TIMEOUT
+          // expire while the user is away - a long model turn (or a long pause
+          // while the model reads a big tool result) is the norm off-screen, and
+          // silently ending the loop would strand the whole build. Resetting the
+          // deadline only while hidden means a genuinely stalled reply still
+          // times out once the user returns to the foreground tab.
+          lastActiveAt = Date.now();
+          // Without a pause this branch spun the loop flat out while the tab was
+          // hidden - the page never got control back and stayed frozen.
+          await sleep(500);
+        } else {
+          const parked = await parkHidden();
+          if (A.stop) return { kind: "stopped" };
+          if (parked) {
+            lastActiveAt += parked; lastChangeAt += parked;
+            if (doneSince) doneSince += parked;
+            if (genFalseSince) genFalseSince += parked;
+            if (preStartSilent) preStartSilent += parked;
+            if (warmSince) warmSince += parked;
+            if (reasonSince) reasonSince += parked;
+            if (noTurnSince) noTurnSince += parked;
+            if (unsettledSince) unsettledSince += parked;
+            if (genOffFirstAt) genOffFirstAt += parked;
+          }
+        }
+        continue; // re-read everything now that we are (still) processing
+      }
+      const gen = P.isGenerating();
+      if (gen) lastActiveAt = Date.now(); // actively generating ⇒ never time out
+      const d = P.readAssistant();
+      // Sites virtualize their lists, so the absolute assistant count can DROP
+      // even as a new reply is added. A count increase still proves a new turn
+      // appeared; the generating flag is the reliable "reply has begun" signal.
+      // A new reply turn exists. Prefer node IDENTITY (virtualization-proof) when
+      // the provider exposes it: the last assistant turn's id differs from the one
+      // captured at send time. Fall back to the count test otherwise. Without this,
+      // a provider's list virtualisation can keep assistantCount() <= base for a
+      // fresh reply, so the reliableCounts gate below waits out the full NO_TURN_GRACE
+      // (~30s) before finalising a multi_edit - the "input box stuck until I scroll
+      // up" symptom (scrolling re-attached old turns and bumped the count).
+      const curTok = P.lastAssistantId ? P.lastAssistantId() : undefined;
+      // A NULL token means the provider could not read an identity for the
+      // CURRENT last turn (not that the provider lacks ids - that's undefined).
+      // Treating null as "no new reply" wedged the watcher on Qwen: a
+      // REGENERATED turn is rebuilt WITHOUT the id attribute the normal turns
+      // carry, so curTok stayed null, `started` never latched, and the loop
+      // sat in the pre-start branch for the full 60s before ending "empty" -
+      // the regenerated command (complete in the net tap) was never run and
+      // zResume then blocked any retry (validated live via empty.why, 2026-07).
+      // Fall back to the count test instead, exactly as for a provider with no
+      // lastAssistantId at all.
+      const newReply = (curTok !== undefined && curTok !== null)
+        ? (curTok !== A.sendToken)
+        : P.assistantCount() > base;
+
+      // Track whether the CURRENT turn has produced anything. Reset when the
+      // turn node changes (the PREVIOUS turn's content never counts).
+      if (d.item !== curItem) { curItem = d.item; sawContent = false; warmSince = 0; lastGoodReply = ""; }
+      if ((d.reply && d.reply.length) || (d.thinking && d.thinking.length)) sawContent = true;
+      if (d.reply && d.reply.length) lastGoodReply = d.reply;
+
+      if (!started) {
+        // CRITICAL: a bare count increase is NOT enough - the empty turn
+        // CONTAINER can appear seconds before the first token. Require actual
+        // CONTENT (or the generating flag).
+        const hasText = !!((d.reply && d.reply.length) || (d.thinking && d.thinking.length));
+        if (gen || (newReply && hasText)) { started = true; }
+        else {
+          // The site can be slow to even CREATE the reply turn. Keep waiting -
+          // only give up after a long fully-silent window.
+          if (!preStartSilent) preStartSilent = Date.now();
+          // diag: WHICH empty-branch fired matters - a dead post-regenerate turn
+          // on Qwen kept ending "empty" with a complete command in the net tap,
+          // and without the branch name the cause was unfindable from the log.
+          if (Date.now() - preStartSilent > 60000) { diag("empty.why", { branch: "preStart", rep: (d.reply||"").length }); return { kind: "empty" }; }
+          await sleep(200);
+          continue;
+        }
+      }
+
+      // Track text stability (independent of the generating flag). Compare the
+      // NORMALISED reply (collapsed whitespace) so cosmetic re-renders of a large
+      // reply - React re-creating the hidden tool <pre>, syntax-highlight passes,
+      // copy-bar text churn - don't count as real "changes" and keep resetting
+      // lastChangeAt. A churn-poisoned lastChangeAt was stalling finalisation of
+      // big multi_edit blocks ~30s (stuckDone never fired); this can only ever
+      // reduce false changes, so short replies / other providers are unaffected.
+      const replyNorm = (d.reply || "").replace(/\s+/g, " ").trim();
+      if (replyNorm !== lastText) { lastText = replyNorm; lastChangeAt = Date.now(); lastActiveAt = Date.now(); }
+      // How long the generating flag has been OFF. A mid-stream flicker resets
+      // this the instant growth resumes and gen flips back on.
+      if (gen) genFalseSince = 0; else if (!genFalseSince) genFalseSince = Date.now();
+      // DIAG: first gen-off, and count flickers back to true after a gen-off.
+      if (started && !gen && !genOffFirstAt) genOffFirstAt = Date.now();
+      if (prevGen === false && gen && genOffFirstAt) genFlickers++;
+      prevGen = gen;
+
+      if (Date.now() - lastLimitScan > 1000) {
+        lastLimitScan = Date.now();
+        const ctx = P.scanError();
+        if (ctx) return { kind: "context_limit", detail: ctx };
+      }
+
+      // Keep waiting while a tool command is still being streamed (opener written
+      // but no end marker yet) so we never parse/finalize half a command.
+      const blockActive = VSParse.hasOpenToolBlock(d.reply) && Date.now() - lastChangeAt < 6000;
+      // ...but once generation has clearly stopped (stop indicator gone past the
+      // grace window), stop honoring an "open block" - it is DOM churn, not live
+      // streaming. Lets a finished big block finalise in seconds instead of
+      // waiting out ~30s of re-render churn. Safe: real streaming keeps gen true.
+      const genStopped = !gen && genFalseSince && Date.now() - genFalseSince > GEN_STOP_GRACE_MS;
+      const effectiveBlock = blockActive && !genStopped;
+
+      // Fallback: generating flag stuck ON (e.g. a wedged stop button - seen
+      // live on Gemini after a mid-write halt) but the text has been frozen for
+      // a while → stop waiting and finalize. This must BYPASS the gen branch
+      // below entirely: falling through while gen stays true used to reset
+      // doneSince every iteration, so the watcher never finalized at all.
+      // ...but NEVER treat a still-OPEN command block as "done" while the site is
+      // genuinely still generating. A model writing a big command (a 3799-char
+      // execute_luau seen live on GLM) can pause >STABLE_MS between tokens - that
+      // is a mid-write gap, NOT a wedged stop button on a COMPLETE reply. Firing
+      // here parsed the half-written JSON and stamped a false "bad JSON" error
+      // while GLM was still typing. RESPONSE_TIMEOUT still bounds a truly stuck one.
+      const stuckDone = started && d.reply && Date.now() - lastChangeAt > STABLE_MS &&
+        !(gen && VSParse.hasOpenToolBlock(d.reply));
+      if ((gen || effectiveBlock) && !stuckDone) {
+        // DIAG: attribute this wait. genOffFirstAt set ⇒ we are PAST first stop,
+        // so any wait here is tail latency: either gen flickered back on, or an
+        // (effective) open-block reading is holding us.
+        if (genOffFirstAt) { if (gen) waitedFlicker++; else if (effectiveBlock) waitedBlock++; }
+        doneSince = 0;
+        await sleep(160);
+        continue;
+      }
+      if (stuckDone && gen) log("generating flag stuck - falling back to text stability");
+
+      // On providers whose turn counts are RELIABLE (semantic elements, no
+      // list virtualisation - Gemini), never finalize before the reply turn
+      // for THIS send exists. The generating flag can flicker off in the gap
+      // between the send and the new <model-response> node spawning, and the
+      // watcher used to finalize on the PREVIOUS turn's stable text - a
+      // premature loop.end rescued only by autoResume 30-45s later (diag
+      // showed `response kind:text` ~2.4s after loop.start with rp unchanged).
+      // Bounded so a genuinely dead send still ends the turn.
+      if (P.reliableCounts && !newReply) {
+        if (!noTurnSince) noTurnSince = Date.now();
+        // [TRACE] This is the 30s NO_TURN_GRACE gate. If a Qwen tool turn sits here
+        // ~30s EVERY turn, newReply is wrongly stuck false: log the identity values
+        // that decide it so we can see whether curTok is null (id missing on the new
+        // turn -> count fallback) or equal to sendToken (last turn not advancing).
+        const _waited = Date.now() - noTurnSince;
+        if (_waited > 800 && (!A._noTurnLoggedAt || Date.now() - A._noTurnLoggedAt > 3000)) {
+          A._noTurnLoggedAt = Date.now();
+          diag("noTurnGrace.wait", {
+            waitedMs: _waited,
+            curTok: (P.lastAssistantId ? P.lastAssistantId() : undefined),
+            sendToken: A.sendToken,
+            assistantCount: P.assistantCount ? P.assistantCount() : undefined,
+            base, gen, started, replyLen: (d.reply || "").length });
+        }
+        if (Date.now() - noTurnSince < NO_TURN_GRACE_MS) { await sleep(200); continue; }
+      } else {
+        noTurnSince = 0;
+        A._noTurnLoggedAt = 0;
+      }
+
+      if (!doneSince) doneSince = Date.now();
+      if (Date.now() - doneSince < 500) {  // 500ms settle – DOM is stable
+        await sleep(120);
+        continue;
+      }
+
+      // A turn that has produced NOTHING yet is still warming up - never
+      // finalize it as empty/truncated/text (a premature retry interrupts it).
+      if (!sawContent) {
+        if (!warmSince) warmSince = Date.now();
+        if (Date.now() - warmSince < WARMUP_MS) { await sleep(200); continue; }
+        diag("empty.why", { branch: "warmup", rep: (d.reply||"").length, lastGood: lastGoodReply.length });
+        return { kind: "empty" };
+      }
+
+      // Still REASONING / loading: thinking written but no answer yet. Don't
+      // finalize - wait for the reply, bounded. A manually-stopped turn is
+      // exempt so a real stop still ends.
+      if (d.thinking && d.thinking.length && !(d.reply && d.reply.length) && !P.turnHalted(d.item)) {
+        if (!reasonSince) reasonSince = Date.now();
+        if (Date.now() - reasonSince < REASON_NOREPLY_MS) { await sleep(200); continue; }
+      } else {
+        reasonSince = 0;
+      }
+
+      // Blank-read guard: if THIS read came back empty but the same turn had
+      // real text a tick ago, classify that text - see lastGoodReply above.
+      let r = d.reply;
+      if (!r && lastGoodReply) { r = lastGoodReply; diag("reply.blankReadFallback", { len: r.length }); }
+      // "Conversation too long" / "server busy" notices are always SHORT system
+      // messages; gating on a short reply stops the model's own long output
+      // (which may quote those phrases) from tripping them.
+      if (r.length < 400 && P.isTooLongMsg(r)) return { kind: "too_long" };
+      // Hold off on any "unparseable command" verdict while the provider reports
+      // this turn's text is not yet a settled read. Qwen's A/B "dual" turn is the
+      // case: its network tap flips `done` the instant the SSE ends, but the
+      // candidate-1 DOM we parse can still be mid-render, so a real command looks
+      // half-written for a beat. Firing parse_error there sends an ERROR
+      // mid-generation and nags a model that did nothing wrong. Only guard when
+      // the reply already LOOKS like a command (so a plain-text answer is never
+      // delayed) and bound it with UNSETTLED_GRACE_MS. No-op on providers that
+      // don't implement replyUnsettled (DeepSeek/Gemini/GLM/Kimi/Arena).
+      const cmdShaped = P.replyUnsettled && (
+        VSParse.hasToolSignature(r) ||
+        (VSParse.LUA_END_RE.test(r) && !VSParse.LUA_START_RE.test(r)) ||
+        (/"(?:datamodel_type|edits|old_string|new_string|file_path|target_file)"\s*:/.test(r) &&
+          !/"command"\s*:/.test(r))
+      );
+      if (cmdShaped && P.replyUnsettled(d.item)) {
+        if (!unsettledSince) unsettledSince = Date.now();
+        if (Date.now() - unsettledSince < UNSETTLED_GRACE_MS) { await sleep(250); continue; }
+      } else {
+        unsettledSince = 0;
+      }
+      // A/B "carousel" turn (Qwen): while it is unresolved the site REMOVES the
+      // composer from the DOM (validated live: getEditor() is null), so we can't
+      // send the tool result until a candidate is picked - and the read reply is a
+      // partial candidate, so a command there looks "cut off". Per the product rule
+      // we use the FIRST candidate: wait for BOTH candidates to finish generating
+      // (you can't select mid-stream), then auto-select Response 1. That collapses
+      // the carousel to a normal turn - composer returns - and the normal parse/run
+      // path below handles it. Never a parse_error here (the model didn't truncate).
+      // No-op for every provider except Qwen. RESPONSE_TIMEOUT still bounds a truly
+      // stuck carousel, so this cannot hang.
+      if (P.isComparisonTurn && P.isComparisonTurn(d.item)) {
+        if (P.isGenerating()) { await sleep(250); continue; }   // both still writing
+        if (P.resolveComparison && P.resolveComparison()) {
+          diag("carousel.resolved");
+          await sleep(400); continue;                            // let it collapse, re-read
+        }
+        await sleep(250); continue;                              // button not ready yet
+      }
+      if (VSParse.hasToolSignature(r)) {
+        const calls = VSParse.parseToolCalls(r);
+        if (calls.length) { finalizeDiag("tool"); return { kind: "tool", calls, item: d.item }; }
+        // A half-written command + the site's "Continue" button means the command
+        // was truncated mid-stream → resume it rather than reporting bad JSON.
+        if (P.findContinueBtn()) return { kind: "truncated", text: r, item: d.item };
+        // Only fire parse_error if explicit markers were present.
+        if (r.includes(VSParse.START_M) || VSParse.LUA_START_RE.test(r)) return { kind: "parse_error", reason: "malformed", raw: r, item: d.item };
+        // A command opener with no closer (a JSON object that never closed -
+        // the model was halted mid-write and there is no Continue affordance):
+        // ask the model to rewrite it instead of silently ending the turn.
+        // ...unless ONLY the trailing closers were lost (the model hit its
+        // output limit with the payload complete - seen live on Qwen: a big
+        // multi_edit missing exactly one final "}"). salvageCutOff auto-closes
+        // and runs it instead of burning a whole retry turn; it refuses any
+        // cut that amputated real content (mid-string / deep deficit), which
+        // still falls through to the parse_error feedback. Safe to run here:
+        // generation has ended (the open-block branch above kept waiting
+        // while it streamed).
+        if (VSParse.hasOpenToolBlock(r)) {
+          const saved = VSParse.salvageCutOff(r);
+          if (saved) {
+            diag("tool.salvaged", { name: saved.tool });
+            finalizeDiag("tool");
+            return { kind: "tool", calls: [saved], item: d.item };
+          }
+          return { kind: "parse_error", reason: "unclosed", raw: r, item: d.item };
+        }
+        // A closed-looking JSON command envelope that NAMES A REAL TOOL but failed
+        // to parse - typically an unescaped " inside a code/string param broke the
+        // JSON (seen live on Kimi's execute_blender_code: `name = "Camera_System"`
+        // mid-code). Unlike execute_luau there is NO ###LUA### fallback, so the
+        // command silently dropped and the loop finalized the turn as a plain-text
+        // answer with no result and no error - a dead turn. Fire a parse_error so
+        // the model can fix its JSON. GATED on a known command name so prose that
+        // merely quotes {"command":"..."} (a DeepSeek-style explanation, or a
+        // placeholder like "command_name") is NOT misread as a broken command and
+        // looped on - only a real tool name means a genuine failed call.
+        const nm = VSParse.toolNameFromText(r);
+        if (nm && nm !== "command" && (A.toolNames.has(nm) || A.toolNames.has(bareToolName(nm)))) {
+          return { kind: "parse_error", reason: "malformed", raw: r, item: d.item };
+        }
+      }
+      // Malformed execute_luau: the model wrote the ###END_LUA### closer but
+      // FORGOT the ###LUA### opener, so hasToolSignature missed it and the block
+      // never ran (seen on Gemini). Don't silently treat it as a final answer -
+      // nudge a rewrite instead of leaving the user stuck on a dead turn.
+      if (VSParse.LUA_END_RE.test(r) && !VSParse.LUA_START_RE.test(r) && !r.includes(VSParse.START_M)) {
+        return { kind: "parse_error", reason: "luaOpener", raw: r, item: d.item };
+      }
+      // Malformed command: the model emitted a tool's RAW ARGUMENTS as a bare JSON
+      // object (e.g. {"datamodel_type":...,"edits":[...],"file_path":...}) instead of
+      // the required {"command":...,"params":...} envelope - it treated the tool as a
+      // real callable function (seen on Gemini). Those argument keys never appear in a
+      // normal prose answer, so nudge a rewrite rather than ending the turn silently.
+      if (/"(?:datamodel_type|edits|old_string|new_string|file_path|target_file)"\s*:/.test(r) &&
+          !/"command"\s*:/.test(r)) {
+        return { kind: "parse_error", reason: "envelope", raw: r, item: d.item };
+      }
+      // NOTE: a site "server busy / something went wrong" notice is deliberately
+      // NOT special-cased. It falls through to kind:"text" below and simply ENDS
+      // the loop as a final answer - no auto-retry. Retrying risked an infinite
+      // re-answer loop when the model's OWN prose said "try again", and treating
+      // busy as a normal terminal turn is cleaner: the user just re-sends if the
+      // site actually hiccuped. (P.isBusyMsg stays on the provider interface,
+      // unused by the core, in case a future flow wants it.)
+      // The site caps output length and shows a native "Continue" button when it
+      // truncates. We try clicking it directly (same turn) in the loop.
+      if (P.findContinueBtn()) return { kind: "truncated", text: r, item: d.item };
+      if (r === "") { diag("empty.why", { branch: "finalBlank" }); return { kind: "empty" }; }
+      return { kind: "text", text: r };
+    }
+    return { kind: "timeout" };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  TOOL EXECUTION  (always returns a feedback string for the model)
+  // ════════════════════════════════════════════════════════════════════════
+  function bg(msg) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(msg, (resp) => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, kind: "disconnected", error: chrome.runtime.lastError.message });
+          } else {
+            resolve(resp || { ok: false, kind: "disconnected", error: "no response from background" });
+          }
+        });
+      } catch (e) {
+        resolve({ ok: false, kind: "disconnected", error: String(e) });
+      }
+    });
+  }
+
+  // 'subagent' is always blocked (long-running, hangs the loop). 'screen_capture'
+  // is only blocked on providers whose underlying model can't see images
+  // (P.supportsVision === false) - see providers/*.js for the per-site flag.
+  // Both are filtered out of the advertised command list AND refused in runTool.
+  // Addon servers (Blender, Sketchfab, ...) can ALSO ship an image-returning
+  // tool under any name we don't know in advance - rather than guess names,
+  // any tool result carrying images is caught generically at the point results
+  // are handled (see the `r.images.length` branch) and turned into a plain
+  // error on non-vision providers, so nothing needs to be predicted here.
+  const ALWAYS_BLOCKED_TOOLS = new Set(["subagent"]);
+  const VISION_TOOLS = new Set(["screen_capture"]);
+  const bareToolName = (name) => (name && name.includes("/") ? name.split("/").pop() : name) || "";
+  const isBlockedTool = (name) => {
+    const bare = bareToolName(name);
+    if (ALWAYS_BLOCKED_TOOLS.has(bare)) return true;
+    if (VISION_TOOLS.has(bare) && !P.supportsVision) return true;
+    return false;
+  };
+
+  // ── Learned image tools (reload-proof "screen" chip) ──────────────────────
+  // The known Roblox vision tool (screen_capture) is themed "screen" by name via
+  // VS.toolCategory. A custom MCP tool's NAME reveals nothing, so we learn which
+  // ones return images and persist that across reloads: with it, a revisited or
+  // reloaded conversation still shows the image-capture chip (not the generic
+  // wrench), and the NEXT call of a known image tool is optimistic from the start.
+  // The marker below is the exact tail runTool appends to a feedback that carries
+  // an image (see runTool's r.images branch) - the reload-proof signal, readable
+  // straight from the injected result turn's text even when no loop is running.
+  const IMAGE_FEEDBACK_RE = /image is attached to THIS message/i;
+  function rememberImageTool(name) {
+    const bare = bareToolName(name);
+    if (!bare || A.imageTools.has(bare)) return;
+    A.imageTools.add(bare);
+    diag("imageTool.remember", { name: bare, total: A.imageTools.size });
+    try { chrome.storage.local.set({ vsImageTools: [...A.imageTools].slice(-200) }); } catch {}
+  }
+  try {
+    chrome.storage.local.get("vsImageTools", (r) => {
+      if (r && Array.isArray(r.vsImageTools)) for (const n of r.vsImageTools) A.imageTools.add(n);
+      diag("imageTool.loaded", { tools: [...A.imageTools] });
+    });
+  } catch {}
+
+  // How long a fetched catalogue stays good enough to reuse without a round trip.
+  const TOOLS_TTL_MS = 30000;
+
+  // Refresh the tool catalogue - but never pay for it twice in a row.
+  //
+  // DEGRADED MODE (Roblox Studio closed, running on an addon server like Blender)
+  // is where this used to hurt: a list_tools whose Roblox half is dead blocks the
+  // bridge until it gives up, and the extension waited the FULL background timeout
+  // for it. The boot sequence calls this three times in a row - startSession(),
+  // then the model's list_commands, then list_mcp_servers - so the user watched
+  // ~a minute of dead air with the model's reply already finished on screen
+  // ("the first commands take forever even though the model clearly stopped
+  // writing"). A short TTL collapses those three calls into one, and the caller
+  // keeps the catalogue it already has instead of stalling for a fresh one.
+  async function ensureTools(force) {
+    if (!force && A.toolList.length && Date.now() - A.toolsAt < TOOLS_TTL_MS) {
+      diag("tools.cached", { age: Date.now() - A.toolsAt, n: A.toolList.length });
+      return A.toolList;
+    }
+    const t0 = Date.now();
+    const r = await bg({ type: "list_tools" });
+    diag("tools.fetched", { ms: Date.now() - t0, n: (r && r.tools && r.tools.length) || 0 });
+    if (r && r.tools && r.tools.length) {
+      const tools = r.tools.filter((t) => !isBlockedTool(t.name));
+      A.toolList = tools;
+      A.toolNames = new Set(tools.map((t) => t.name));
+      A.toolsAt = Date.now();
+    }
+    return A.toolList;
+  }
+
+  // ── Script undo stack (Feature: auto-rollback) ───────────────────────────
+  // Before every multi_edit on an EXISTING script we snapshot its source (a
+  // script_read, reconstructed to raw text). The virtual `revert_last` command
+  // then restores that source by reading the CURRENT text and replacing the
+  // whole thing back - robust regardless of how the edit changed the file.
+  const _inRevert = { on: false };
+  const _undoStack = [];
+  // Persisted copy of the undo stack (chrome.storage.local "vsUndoStack", cap 50),
+  // so snapshots survive a page reload - a reload mid-build no longer loses the
+  // ability to revert what the session did before it.
+  try {
+    chrome.storage.local.get("vsUndoStack", (r) => {
+      if (r && Array.isArray(r.vsUndoStack)) {
+        _undoStack.length = 0;
+        for (const e of r.vsUndoStack) {
+          if (e && typeof e.path === "string" && typeof e.before === "string" && typeof e.t === "number") _undoStack.push(e);
+        }
+        _undoStack.sort((a, b) => a.t - b.t);
+      }
+    });
+  } catch {}
+  function persistUndoStack() {
+    try { chrome.storage.local.set({ vsUndoStack: _undoStack.slice(-50) }); } catch {}
+  }
+  // ── Named Lua macros (Feature: reusable snippets) ─────────────────────────
+  // The model can save a Luau snippet once (save_macro) and re-run it any time
+  // (run_macro) instead of retyping it - cuts token waste and typos on long
+  // builds. Persisted per-user in chrome.storage.local (vsMacros).
+  let _macros = {};
+  try {
+    chrome.storage.local.get("vsMacros", (r) => {
+      if (r && typeof r.vsMacros === "object" && r.vsMacros) _macros = r.vsMacros;
+    });
+  } catch {}
+  function persistMacros() {
+    try { chrome.storage.local.set({ vsMacros: _macros }); } catch {}
+  }
+  // ── Resume-from-crash (Feature) ────────────────────────────────────────────
+  // Remember the most recent tool dispatched per conversation so a page reload /
+  // crash mid-session can nudge the model to re-run or continue the interrupted
+  // command instead of silently drop it.
+  function persistLastCommand(name, args) {
+    try {
+      chrome.storage.local.set({ vsLastCommand: { conv: P.conversationKey(), tool: name, args, t: Date.now() } });
+    } catch {}
+  }
+  let _lastCmd = null;
+  try {
+    chrome.storage.local.get("vsLastCommand", (r) => {
+      if (r && r.vsLastCommand) _lastCmd = r.vsLastCommand;
+    });
+  } catch {}
+  // A short system-note for the FIRST prompt of a new session when the previous
+  // one was interrupted mid-command in this same conversation. Consumed once.
+  function resumeNote() {
+    if (!_lastCmd || !_lastCmd.tool) return "";
+    if (_lastCmd.conv && _lastCmd.conv !== P.conversationKey()) return "";
+    if (Date.now() - (_lastCmd.t || 0) > 6 * 3600 * 1000) return "";
+    const note = `\n\n(System note: the previous session in this conversation was interrupted while running the command ${_lastCmd.tool}. If it never returned a result, re-run it now; otherwise just continue the build.)`;
+    _lastCmd = null;
+    try { chrome.storage.local.remove("vsLastCommand"); } catch {}
+    return note;
+  }
+  // ── Session resume across reloads ─────────────────────────────────────────
+  // The auto-resume watchdog's freshness clock (A.lastGenAt) lives only in
+  // memory, so a page refresh mid-build wiped it and the watchdog could never
+  // resume the in-flight command turn (it reads "not a fresh live turn"). We
+  // persist a small liveness record (conversation + last-generation timestamp)
+  // while the agent generates, and restore it on reload when the same
+  // conversation is still open - the watchdog then picks the interrupted
+  // command back up automatically. Cleared on an explicit stop.
+  let _lastResumePersistAt = 0;
+  function persistLoopResume() {
+    const now = Date.now();
+    if (now - _lastResumePersistAt < 3000) return;
+    _lastResumePersistAt = now;
+    try {
+      chrome.storage.local.set({ vsLoopResume: { conv: P.conversationKey(), lastGenAt: A.lastGenAt, t: now } });
+    } catch {}
+  }
+  function clearLoopResume() {
+    try { chrome.storage.local.remove("vsLoopResume"); } catch {}
+  }
+  // ── Context compaction (Feature: survive the context limit) ───────────────
+  // When a provider reports it is at/near its context limit, the loop asks the
+  // model for a compact "build state" handoff BEFORE giving up, persists it, and
+  // the next session started in a fresh chat auto-seeds that handoff as its
+  // first message - so a long build continues in a new chat instead of dying.
+  let _compactHandoff = null;
+  let _compactInFlight = false;
+  function compactNow(reason) {
+    if (_compactInFlight || A.compacting) return;
+    if (!A.running || A.stop) return;
+    _compactInFlight = true;
+    A.compacting = true;
+    ui.toast("Context full - capturing build state…");
+    (async () => {
+      try {
+        const base = await submitAndGetBase(VS.FEEDBACK.compact);
+        if (A.stop) return;
+        const res = await waitForResponse(base);
+        const text = res && res.text ? String(res.text) : "";
+        if (!text.trim()) throw new Error("empty handoff reply");
+        _compactHandoff = {
+          summary: text.trim().slice(0, 6000),
+          projectType: ui.getProjectType() || "",
+          t: Date.now(),
+        };
+        try { chrome.storage.local.set({ vsCompactionHandoff: _compactHandoff }); } catch {}
+        diag("compact.saved", { reason, len: _compactHandoff.summary.length });
+        ui.banner("ok", "Build state saved",
+          `${P.displayName} hit its context limit, so I saved a compact handoff of the build. Open a new chat on ${P.displayName} and press Start - the agent continues from the saved state automatically.`);
+      } catch (e) {
+        diag("compact.failed", { reason, error: String((e && e.message) || e) });
+        ui.banner("limit", `${P.displayName} reached its context limit`,
+          (reason === "too_long" ? "The conversation got too long." : "The context window filled up.") +
+          "  -  the build state could not be captured automatically. Start a new session; the project memory in Studio still holds what was built.");
+      } finally {
+        _compactInFlight = false;
+        A.compacting = false;
+      }
+    })();
+  }
+  try {
+    chrome.storage.local.get("vsCompactionHandoff", (r) => {
+      const h = r && r.vsCompactionHandoff;
+      if (h && h.summary) {
+        if (Date.now() - (h.t || 0) < 24 * 3600 * 1000) _compactHandoff = h;
+        else try { chrome.storage.local.remove("vsCompactionHandoff"); } catch {}
+      }
+    });
+  } catch {}
+  // ── Provider leaderboard (Feature: per-site build quality) ─────────────────
+  // On every completed session we tally tool success/errors and screenshots per
+  // provider site, then rank providers by success rate in the popup so the user
+  // can pick the model that actually builds best for them.
+  function recordBuildResult() {
+    try {
+      const name = P.displayName || "unknown";
+      const key = name.toLowerCase().replace(/\s+/g, "_");
+      chrome.storage.local.get("vsLeaderboard", (r) => {
+        const lb = (r && r.vsLeaderboard) || {};
+        const e = lb[key] || { name, runs: 0, ok: 0, err: 0, shots: 0 };
+        e.runs++; e.ok += A.runOk || 0; e.err += A.runErr || 0; e.shots += A.shotCount || 0; e.lastT = Date.now();
+        lb[key] = e;
+        chrome.storage.local.set({ vsLeaderboard: lb });
+      });
+    } catch {}
+  }
+  // ── Shareable build recipes (Feature): link replays this setup ─────────────
+  // A recipe is a small JSON blob {v, prompt, projectType, servers, starter}
+  // base64url-encoded into a ?vsRecipe= param on a supported AI URL. Opening
+  // that link re-applies the custom prompt, genre, addon names and the last
+  // wizard starter, then auto-starts the session - one link replays the build.
+  function recipeEncode(recipe) {
+    try {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(recipe))))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    } catch { return ""; }
+  }
+  function recipeDecode(b64) {
+    try {
+      const s = b64.replace(/-/g, "+").replace(/_/g, "/");
+      const pad = s.length % 4 ? "=".repeat(4 - (s.length % 4)) : "";
+      return JSON.parse(decodeURIComponent(escape(atob(s + pad))));
+    } catch { return null; }
+  }
+  function buildRecipeLink() {
+    const recipe = {
+      v: 1,
+      prompt: ui.getCustomPrompt() || "",
+      projectType: ui.getProjectType() || "",
+      servers: (ui.getCustomMcpServers() || []).map((s) => s.name || s.id).filter(Boolean),
+      starter: A.recipeStarter || "",
+    };
+    const enc = recipeEncode(recipe);
+    if (!enc) return "";
+    return (AI_SITES[0] ? AI_SITES[0].url : "https://chat.deepseek.com/") + "?vsRecipe=" + enc;
+  }
+  function applyRecipe(href) {
+    try {
+      const m = /[?&]vsRecipe=([^&#]+)/.exec(href || location.href);
+      if (!m) return;
+      const recipe = recipeDecode(m[1]);
+      if (!recipe || !recipe.v) return;
+      // Consume the param so a reload doesn't replay it.
+      try {
+        const clean = location.href.replace(/[?&]vsRecipe=[^&#]+/, "");
+        history.replaceState(null, "", clean || location.pathname);
+      } catch {}
+      ui.setCustomPrompt(recipe.prompt || "");
+      const pt = recipe.projectType || "";
+      ui.setProjectType(pt);
+      if (recipe.starter) { A.recipeStarter = recipe.starter; ui.setWizardPrompt(recipe.starter); }
+      diag("recipe.applied", { prompt: (recipe.prompt || "").length, projectType: pt, servers: (recipe.servers || []).length });
+      ui.toast(recipe.starter ? "Build recipe applied - starting your session…" : "Build recipe applied - press Start to begin.");
+      // Auto-replay: if a session is ready to start and none is active, start it.
+      if (recipe.starter && !A.started && !A.starting && !A.running && !A.injecting) {
+        setTimeout(() => { if (!A.started && !A.running) startSession(); }, 400);
+      }
+    } catch (e) {
+      diag("recipe.error", { msg: String((e && e.message) || e) });
+    }
+  }
+
+  // ── Session timeline (Feature: replayable history) ─────────────────────────
+  // Append-only, capped per-run log of what the agent did: tools, edits,
+  // screenshots, errors and session start/stop. Surfaced in the popup.
+  function timeline(type, payload) {
+    try {
+      chrome.storage.local.get("vsTimeline", (r) => {
+        let arr = (r && r.vsTimeline) || [];
+        arr.push({ t: Date.now(), conv: P.conversationKey(), type, ...(payload || {}) });
+        if (arr.length > 400) arr = arr.slice(-400);
+        chrome.storage.local.set({ vsTimeline: arr });
+      });
+    } catch {}
+  }
+  // Session log text (Feature): the same build-log the menu copies, as a
+  // Promise<string> usable anywhere (download button + auto-write on stop).
+  function buildSessionLogText() {
+    return new Promise((res) => {
+      try {
+        chrome.storage.local.get("vsTimeline", (r) => {
+          const conv = P.conversationKey();
+          const arr = ((r && r.vsTimeline) || []).filter((e) => e.conv === conv);
+          if (!arr.length) return res("");
+          const lines = arr.map((e) => {
+            const ts = new Date(e.t || 0).toLocaleTimeString();
+            if (e.type === "session_start") return `[${ts}] session start`;
+            if (e.type === "session_stop") return `[${ts}] session stop`;
+            if (e.type === "tool") return `[${ts}] ${e.ok ? "OK" : "ERR"} ${e.name || ""}${e.err ? " · " + e.err : ""}`;
+            if (e.type === "shot") return `[${ts}] screenshot · ${e.label || e.tool || ""}`;
+            return `[${ts}] ${e.type}`;
+          });
+          res(lines.join("\n"));
+        });
+      } catch { res(""); }
+    });
+  }
+  function downloadTextFile(name, text) {
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 800);
+    } catch {}
+  }
+  // Auto-write the finished session's build log to disk via the bridge (Feature:
+  // logs/session-<date>.log). Best-effort, never blocks the loop.
+  function writeSessionLogToDisk(summary) {
+    try {
+      buildSessionLogText().then((log) => {
+        if (!log) return;
+        const header = `\n===== VoidScript session ${new Date().toLocaleString()} =====\n${summary || ""}\n`;
+        chrome.runtime.sendMessage({ type: "write_log", text: header + log }).catch(() => {});
+      });
+    } catch {}
+  }
+  function speakDone(okCount, errCount) {
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth) return;
+      const u = new SpeechSynthesisUtterance(
+        `VoidScript session complete. ${okCount} commands, ${errCount} errors.`);
+      u.volume = 0.8; u.rate = 1.05;
+      synth.speak(u);
+    } catch {}
+  }
+  // Auto-summary (Feature: vsAutoSummary): after a clean session end, ask the
+  // model for a plain-text recap in ONE extra turn. Guarded so the auto-resume
+  // watchdog can never re-run a tool from the summary turn (A.userStopped is
+  // latched for the turn, exactly like a manual halt).
+  let _summaryRunning = false;
+  function scheduleAutoSummary() {
+    if (_summaryRunning || !vsOn("vsAutoSummary")) return;
+    if (A.userStopped || A.stop || A.stopping || document.hidden) return;
+    if (!(A.runOk || A.runErr)) return;
+    _summaryRunning = true;
+    setTimeout(async () => {
+      try {
+        if (A.running || A.starting || A.started === false || document.hidden) return;
+        A.userStopped = true; // disarms the watchdog for this turn
+        const prompt = VS.FEEDBACK.summaryAsk || "Summarize in a short paragraph what you just built and any next steps.";
+        const base = await submitAndGetBase(prompt);
+        noteTokens("prompt", prompt);
+        await waitForResponse(base);
+        diag("autosummary.done", {});
+      } catch {}
+      finally { _summaryRunning = false; }
+    }, 1600);
+  }
+  // Deletes that are almost never intended: clearing/destroying a WHOLE Roblox
+  // service or the game itself. Scoped deletions of named instances never match.
+  const BROAD_DELETE_RE =
+    /(game|workspace|players|replicatedstorage|serverstorage|lighting|debris|collectionhtmlservice)\s*\.\s*clearallchildren\s*\(|:\s*clearallchildren\s*\(\s*\)|(game|workspace|players)\s*:\s*destroy\s*\(/i;
+  function extractScriptSource(readOut) {
+    const body = String(readOut || "").replace(/^Output of '[^']*':\s*/m, "");
+    return body
+      .split("\n")
+      .map((l) => l.replace(/^\s*\d+[→:]\s*/, ""))
+      .join("\n");
+  }
+  // Pre-flight Luau sanity check (best-effort, conservative). Runs BEFORE the
+  // call is sent to Studio so an obviously broken snippet gets fixed without
+  // burning the ~20s execute_luau budget. Only flags unambiguous syntax errors
+  // (unclosed long comments/strings, unterminated short strings, unbalanced
+  // brackets) - it skips comments and strings, so valid code is never rejected.
+  // Returns an ERROR string to feed back, or null when the code looks sound.
+  function preflightLuau(src) {
+    const s = String(src || "");
+    const n = s.length;
+    const lineOf = (idx) => s.slice(0, idx).split("\n").length;
+    const findLongClose = (openIdx, bodyStart, eq) => {
+      const close = "]" + "=".repeat(eq) + "]";
+      const k = s.indexOf(close, bodyStart);
+      return k === -1 ? null : k + close.length;
+    };
+    const stack = [];
+    let i = 0;
+    while (i < n) {
+      const c = s[i];
+      const c2 = s.slice(i, i + 2);
+      if (c2 === "--") {
+        if (s[i + 2] === "[") {
+          let eq = 0, j = i + 3;
+          while (s[j] === "=") { eq++; j++; }
+          if (s[j] === "[") {
+            const k = findLongClose(i, j + 1, eq);
+            if (k === null) return `ERROR: execute_luau has an unclosed long comment --[${"=".repeat(eq)}[ (started on line ${lineOf(i)}, never closed with ]${"=".repeat(eq)}]). Close it or remove it, then retry.`;
+            i = k;
+            continue;
+          }
+        }
+        const nl = s.indexOf("\n", i + 2);
+        i = nl === -1 ? n : nl + 1;
+        continue;
+      }
+      if (c === "[") {
+        let eq = 0, j = i + 1;
+        while (s[j] === "=") { eq++; j++; }
+        if (s[j] === "[") {
+          const k = findLongClose(i, j + 1, eq);
+          if (k === null) return `ERROR: execute_luau has an unclosed long string [${"=".repeat(eq)}[ (started on line ${lineOf(i)}, never closed with ]${"=".repeat(eq)}]). Close it, then retry.`;
+          i = k;
+          continue;
+        }
+      }
+      if (c === '"' || c === "'") {
+        let j = i + 1, closed = false;
+        while (j < n) {
+          if (s[j] === "\\") { j += 2; continue; }
+          if (s[j] === c) { closed = true; break; }
+          if (s[j] === "\n") break;
+          j++;
+        }
+        if (!closed) return `ERROR: execute_luau has an unterminated ${c === '"' ? "double-quoted" : "single-quoted"} string starting on line ${lineOf(i)} - the closing quote is missing. Fix or remove it, then retry.`;
+        i = j + 1;
+        continue;
+      }
+      if (c === "(" || c === "[" || c === "{") stack.push({ c, line: lineOf(i) });
+      else if (c === ")" || c === "]" || c === "}") {
+        const open = { ")": "(", "]": "[", "}": "{" }[c];
+        const top = stack.pop();
+        if (!top || top.c !== open) {
+          const expect = stack.length ? stack[stack.length - 1] : null;
+          return `ERROR: execute_luau has a mismatched '${c}' on line ${lineOf(i)}${expect ? ` - expected '${expect.c === "(" ? ")" : expect.c === "[" ? "]" : "}"}' from line ${expect.line}` : ""}. Fix the brackets, then retry.`;
+        }
+      }
+      i++;
+    }
+    if (stack.length) {
+      const open = stack[stack.length - 1];
+      const close = open.c === "(" ? ")" : open.c === "[" ? "]" : "}";
+      return `ERROR: execute_luau has an unclosed '${open.c}' opened on line ${open.line} - it needs a matching '${close}'. Fix it, then retry.`;
+    }
+    return null;
+  }
+  async function snapshotBeforeEdit(args) {
+    const path = args && args.target_file;
+    if (!path) return;
+    try {
+      const pre = await runTool({ tool: "script_read", arguments: { target_file: path, datamodel_type: "Edit" } });
+      if (pre.startsWith("ERROR")) return; // script is being created → nothing to roll back to yet
+      const before = extractScriptSource(pre);
+      if (!before.trim()) return;
+      _undoStack.push({ path, before, t: Date.now() });
+      if (_undoStack.length > 50) _undoStack.shift();
+      persistUndoStack();
+      diag("rollback.snap", { path, len: before.length });
+    } catch {}
+  }
+  // Restore a single undo entry: read the script's CURRENT source and multi_edit
+  // the whole thing back to `before`. Shared by revert_last and revert_session.
+  async function revertEntry(entry) {
+    const cur = await runTool({ tool: "script_read", arguments: { target_file: entry.path, datamodel_type: "Edit" } });
+    if (cur.startsWith("ERROR")) return `ERROR: could not read '${entry.path}' to revert it: ${cur.slice(0, 160)}`;
+    const curText = extractScriptSource(cur);
+    if (!curText.trim()) return `ERROR: could not parse the current source of '${entry.path}' for revert.`;
+    _inRevert.on = true;
+    let applied;
+    try {
+      applied = await runTool({ tool: "multi_edit", arguments: { datamodel_type: "Edit", target_file: entry.path, edits: [{ old_string: curText, new_string: entry.before }] } });
+    } finally { _inRevert.on = false; }
+    if (applied.startsWith("ERROR")) return `ERROR reverting '${entry.path}': ${applied.slice(0, 200)}`;
+    return "OK";
+  }
+
+  // Trust-level approval gate (Feature: vsTrustLevel). For "medium" the agent
+  // pauses for user approval on destructive calls; for "low" it pauses before
+  // every command. The loop is parked via A.paused so the bar shows "Resume" -
+  // pressing Resume allows the call, Stop cancels it. Returns true to proceed.
+  async function confirmGate(call, reason) {
+    if (A.stop) return false;
+    const summary = argSummary(call);
+    A.paused = true;
+    ui.banner("warn", `Approve ${reason}`,
+      `${call.tool}${summary ? " (" + summary + ")" : ""} is waiting for your approval. Press Resume to allow it, or Stop to cancel it.`);
+    diag("confirm.wait", { tool: call.tool, reason });
+    while (!A.stop && A.paused) await sleep(250);
+    return !A.stop;
+  }
+
+  async function runTool(call) {
+    const name = call.tool;
+    const args = call.arguments || {};
+    if (!name) return VS.FEEDBACK.parseError("malformed");
+    // NEVER execute while the AI tab is backgrounded/minimized. This is the single
+    // choke point for ALL execution (agentLoop's tool dispatch AND the bootstrap's
+    // list_commands), so it closes the hole the loop-entry gate alone left open:
+    // the tab is foreground when a cycle starts, the model then generates for
+    // 30-120s, the user minimizes MID-generation, and waitForResponse returns a
+    // tool call that fired into Studio off-screen (observed live: GLM minimized
+    // still ran execute_luau). Parking here (no time cap) means the call runs the
+    // moment the tab is foreground again, instead of being lost or run blind.
+    if (document.hidden && !bgMode() && !A.stop) {
+      diag("tool.waitVisible", { name });
+      // Only reachable via a user Stop while parked; agentLoop's post-runTool
+      // A.stop check breaks the loop and discards this, so it just needs to be
+      // a non-crashing, clearly-labelled string.
+      if (!(await waitVisible()) || A.stop) return "ERROR: the command was not run - stopped by the user.";
+    }
+    // Blocked commands: refuse up-front with a clear, tailored error so the
+    // model abandons it and continues instead of wasting/hanging a turn.
+    const bareName = bareToolName(name);
+    if (isBlockedTool(name)) {
+      if (VISION_TOOLS.has(bareName)) {
+        return `ERROR: '${bareName}' is unavailable here - this assistant cannot see images. Do NOT call it again. Inspect the place programmatically instead (e.g. inspect_instance, get_studio_state, search_game_tree, script_read).`;
+      }
+      return `ERROR: the '${bareName}' command timed out and is unavailable in this environment. Do NOT call it again - complete the task yourself using the other commands (execute_luau, multi_edit, etc.).`;
+    }
+    // Virtual command: list the MCP server(s) VoidScript is currently connected
+    // to, with each one's REAL per-server health (from the bridge, never the
+    // merged tool count - a dead server must not borrow another's numbers).
+    if (name === "list_mcp_servers") {
+      await ensureTools();
+      const servers = (A.bridge && A.bridge.servers) || [];
+      const lines = servers.length
+        ? servers.map((sv) => {
+            const label = sv.id === "roblox" ? "Roblox Studio (primary)" : `${sv.id} (addon)`;
+            return `- ${sv.id}: ${label} - ${sv.alive ? `${sv.tools || 0} commands available` : "offline (no tools)"}`;
+          })
+        : ["- roblox: Roblox Studio (primary) - unknown (bridge did not report server health)"];
+      return (
+        `Output of 'list_mcp_servers':\n` +
+        `Connected MCP servers (${lines.length}):\n${lines.join("\n")}\n` +
+        `Use list_commands with a "server" param (one of the ids above) to see that server's exact commands. Without "server", list_commands defaults to "roblox".`
+      );
+    }
+    // Virtual command: list available commands with full details. Defaults to
+    // the primary Roblox server - a DIFFERENT server's tools only ever show up
+    // if the model explicitly asks via {"server": "<id>"} (see list_mcp_servers).
+    if (name === "list_commands" || name === "list_tools") {
+      await ensureTools();
+      const requested = (args.server || "roblox").trim();
+      // The MCP proxy keeps advertising Roblox's catalogue even with no Studio
+      // attached, so list_commands would hand back the full command list and read
+      // as "Roblox is fine" - then every command silently fails. When Roblox is
+      // actually unusable, short-circuit the DEFAULT (roblox) listing into a plain
+      // "Roblox is down" note that points the model at the other server(s), so it
+      // can keep working in degraded mode instead of firing dead Roblox commands.
+      if (requested === "roblox") {
+        const s = A.bridge || {};
+        const srv = s.servers || [];
+        const rbx = srv.find((x) => x.id === "roblox");
+        const rbxAlive = rbx ? !!rbx.alive : (!!s.mcpAlive || srv.some((x) => x.alive));
+        const rbxUsable = !!s.connected && rbxAlive && s.studio !== false;
+        if (!rbxUsable) {
+          const others = srv.filter((x) => x.id !== "roblox" && x.alive && (x.tools || 0) > 0);
+          const otherStr = others.length
+            ? `Other connected MCP server(s): ${others.map((x) => x.id).join(", ")}. Call list_mcp_servers, then list_commands with a "server" param to use them for anything that does not need Roblox.`
+            : `No other MCP server is connected right now.`;
+          return `Output of '${name}':\nRoblox Studio is currently OFFLINE (closed, no place open, or its MCP server disabled), so its commands cannot run. This is an environment problem on the user's machine, not your mistake. Tell the user in one short sentence to open their place in Roblox Studio and enable its MCP server. ${otherStr}`;
+        }
+      }
+      const known = new Set(A.toolList.map((t) => t.server).filter(Boolean));
+      // Tools from a bridge that doesn't tag "server" yet (old version) have no
+      // .server field at all - treat those as the primary server rather than
+      // hiding everything.
+      const scoped = A.toolList.filter((t) => (t.server || "roblox") === requested);
+      if (!A.toolList.length) return `Output of '${name}':\nNo commands available - the bridge or Roblox Studio may be offline.`;
+      if (!scoped.length) {
+        return `Output of '${name}':\nERROR: no server named "${requested}" is connected. Connected servers: ${[...known].join(", ") || "roblox"}. Call list_mcp_servers to check.`;
+      }
+      // The startup prompt carries this whole list; Roblox's full descriptions
+      // made it ~50KB, and pasting that stalls the site's editor. Brief mode
+      // clips them - the model can still call list_commands for the full text.
+      const clip = (str, n) => (args._brief && str && str.length > n ? str.slice(0, n - 1).trimEnd() + "…" : str || "");
+      const lines = scoped.map((t) => {
+        const props = (t.inputSchema && t.inputSchema.properties) || {};
+        const req = new Set((t.inputSchema && t.inputSchema.required) || []);
+        // Two buckets: simple scalar params get packed onto ONE compact line;
+        // params that need real explanation (array-of-object shape, or a long
+        // description) keep their own line so nothing structurally important
+        // gets flattened away (that per-item shape is what fixed "Unknown …
+        // action: nil" bugs on user_keyboard_input/user_mouse_input).
+        const compact = [];
+        const detailed = [];
+        for (const [k, v] of Object.entries(props)) {
+          const items = v.items && typeof v.items === "object" ? v.items : null;
+          const itemProps = items && items.properties;
+          const mark = req.has(k) ? "" : "?";
+          if (v.type === "array" && itemProps) {
+            const itemReq = new Set(items.required || []);
+            const fields = Object.entries(itemProps).map(([ik, iv]) => {
+              const en = Array.isArray(iv.enum) && iv.enum.length <= 12 ? `(${iv.enum.join("|")})` : (iv.type || "any");
+              return `${ik}${itemReq.has(ik) ? "" : "?"}:${en}`;
+            });
+            detailed.push(`    ${k}${mark}: array [each item: {${fields.join(", ")}}]${v.description ? " - " + clip(v.description, 140) : ""}`);
+          } else if (v.description && v.description.length > 45) {
+            detailed.push(`    ${k}${mark}: ${v.type || "any"} - ${clip(v.description, 140)}`);
+          } else {
+            const ty = Array.isArray(v.enum) && v.enum.length <= 8 ? `(${v.enum.join("|")})` : (v.type || "any");
+            compact.push(`${k}${mark}:${ty}${v.description ? ` "${v.description}"` : ""}`);
+          }
+        }
+        const paramLines = [compact.length ? `    ${compact.join(", ")}` : "", ...detailed].filter(Boolean).join("\n");
+        // Tested usage note for the error-prone commands - kept full-length
+        // (these are validated fixes for real bugs, not filler).
+        const note = VS.TOOL_NOTES[bareToolName(t.name)];
+        const noteStr = note ? `\n    ⚠ ${note}` : "";
+        return `${t.name}: ${clip((t.description || "").split("\n")[0], 220)}${paramLines ? "\n" + paramLines : ""}${noteStr}`;
+      });
+      return `Output of '${name}':\n${requested} commands (${scoped.length}):\n\n${lines.join("\n\n")}`;
+    }
+    if (A.toolNames.size && !A.toolNames.has(name)) {
+      return VS.FEEDBACK.unknownTool(name, [...A.toolNames]);
+    }
+    // Virtual command: undo the LAST snapshot (the most recent multi_edit on an
+    // existing script). Read the current source, then multi_edit the whole thing
+    // back to the pre-edit source. Only works when a snapshot exists - a newly
+    // CREATED script has no previous source, so we say so plainly.
+    if (name === "revert_last") {
+      const top = _undoStack.pop();
+      if (!top) {
+        return "ERROR: nothing to revert - no earlier script edit was snapshotted (rollback only tracks edits to existing scripts).";
+      }
+      const res = await revertEntry(top);
+      if (res.startsWith("ERROR")) { _undoStack.push(top); return res; }
+      persistUndoStack();
+      diag("rollback.done", { path: top.path, len: top.before.length });
+      return `Output of 'revert_last':\nReverted the last edit to '${top.path}' (restored the earlier source). The result is attached - verify it looks right and continue.`;
+    }
+    // Virtual command: revert the WHOLE session - restore every script the
+    // session edited back to the state it was in when the session started
+    // (the undo-stack boundary captured at agentLoop start). Entries are
+    // reverted in reverse order so each script ends at its OLDEST snapshot,
+    // then the stack is truncated back to the boundary. Capped at 30 reverts
+    // per call to keep the round-trip sane.
+    if (name === "revert_session") {
+      const boundary = A.undoSessionStart || 0;
+      if (_undoStack.length <= boundary) {
+        return "ERROR: nothing to revert - this session has not edited any existing script yet (rollback only tracks edits to existing scripts).";
+      }
+      const toRevert = _undoStack.slice(boundary).reverse().slice(0, 30);
+      const done = [];
+      const failed = [];
+      for (const entry of toRevert) {
+        const res = await revertEntry(entry);
+        if (res.startsWith("ERROR")) { failed.push(entry.path); continue; }
+        done.push(entry.path);
+      }
+      // Drop the reverted entries (and any newer ones) regardless of individual
+      // failures, so a partial revert still leaves a consistent stack.
+      _undoStack.length = Math.min(boundary, _undoStack.length);
+      persistUndoStack();
+      const where = done.length ? `restored ${done.length} script${done.length === 1 ? "" : "s"} (${[...new Set(done)].slice(0, 5).join(", ")}${new Set(done).size > 5 ? "…" : ""})` : "";
+      const failNote = failed.length ? `; ${failed.length} could not be reverted (${[...new Set(failed)].slice(0, 3).join(", ")})` : "";
+      return `Output of 'revert_session':\nReverted this session's edits - ${where || "no scripts were reverted"}${failNote}. The results are attached - verify each looks right and continue.`;
+    }
+    // Virtual command: export a snapshot of this session's undo history (every
+    // script edit + its pre-edit source) as a downloadable JSON file. Gives the
+    // user a portable record of what changed, and the pre-edit sources could
+    // later be re-applied elsewhere. Also reachable from the menu (Export).
+    if (name === "export_snapshot") {
+      const snap = {
+        tool: "voidscript-export-snapshot",
+        exportedAt: new Date().toISOString(),
+        provider: P.id,
+        session: { ok: A.runOk || 0, err: A.runErr || 0, startedAt: A.startedAt || 0 },
+        undoStack: _undoStack.slice(-50).map((e) => ({ path: e.path, t: e.t, beforeLength: (e.before || "").length })),
+        macros: Object.keys(_macros || {}),
+      };
+      const json = JSON.stringify(snap, null, 2);
+      try { downloadTextFile(`voidscript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, json); }
+      catch { return "ERROR: could not download the snapshot file (browser blocked the download)."; }
+      const n = snap.undoStack.length;
+      diag("snapshot.export", { entries: n });
+      return `Output of 'export_snapshot':\nExported a snapshot JSON (${json.length} bytes) covering ${n} tracked script edit${n === 1 ? "" : "s"} - it downloaded via the browser. ${n ? "The pre-edit sources are in the file, so nothing is lost if the user wants to undo manually." : ""}`;
+    }
+    // Virtual command: command palette (Feature) - a compact index of the
+    // extension's VIRTUAL commands (the ones that are NOT in the MCP tool list
+    // and do not show up in list_commands). Use it to discover what VoidScript
+    // can orchestrate without re-reading the full system prompt.
+    if (name === "command_palette") {
+      const entries = [
+        ["revert_last", "undo the most recent edit to an existing script"],
+        ["revert_session", "revert every script this session edited, back to session-start state"],
+        ["playtest", "enter play mode; drive the player with user_keyboard_input / user_mouse_input"],
+        ["stop_playtest", "leave play mode after a playtest"],
+        ["save_macro", "save a reusable Luau snippet"],
+        ["run_macro", "run a saved Luau snippet"],
+        ["list_macros", "list saved Luau snippets"],
+        ["export_snapshot", "download a JSON snapshot of this session's edits (pre-edit sources)"],
+        ["plan_build", "lay out a step-by-step build plan before making any change"],
+        ["keep_going", "resume working after a run of errors; continue past the last failure"],
+        ["command_palette", "show this index of virtual commands"],
+      ];
+      return "Output of 'command_palette':\nVoidScript virtual commands (not in list_commands):\n\n" +
+        entries.map(([n, d]) => `  ${n} - ${d}`).join("\n") +
+        "\n\nCall any of these with {\"command\":\"<name>\",\"params\":{...}}. Everything else you need comes from the MCP tool list.";
+    }
+    // Virtual command: plan-then-build (Feature: plan_build). The model writes a
+    // step-by-step plan in its reply, then calls plan_build to PAUSE the loop so
+    // the user can review the plan before any change is made. Resume approves it.
+    if (name === "plan_build") {
+      const text = (args && args.plan) || "";
+      A.paused = true;
+      ui.toast("Building the plan – review, then press Start to run it.");
+      diag("plan.paused", { planLen: text.length });
+      return "Output of 'plan_build':\nPlan mode entered - the plan is written in your message above this result, and VoidScript has PAUSED the loop. The user will review it and press Resume to approve the build (Stop cancels). When resumed, follow the plan exactly and build it step by step with the real commands.";
+    }
+    // Virtual command: keep-going (Feature). After a run of errors, the model can
+    // call this to clear the accumulated error tally and keep working instead of
+    // stalling out - the loop itself never hard-stops on errors, so this mostly
+    // resets the session bookkeeping and signals intent to continue.
+    if (name === "keep_going") {
+      A.runErr = 0;
+      if (A.paused) A.paused = false;
+      diag("keepgoing.resume");
+      return "Output of 'keep_going':\nUnderstood - continuing past the recent errors. The error tally is reset. If a specific command keeps failing, diagnose the root cause (read the script, inspect the instance, check the error) and fix it rather than retrying the identical call.";
+    }
+    // Playtest mode (Feature: the agent plays its own game). `playtest` enters
+    // play mode, feeds the model a first screenshot, and instructs it to drive
+    // the simulated player step by step (each input auto-captures the result).
+    // `stop_playtest` leaves play mode. The actual play-driving is model-steered
+    // (only it knows the scenario); VoidScript provides the orchestration and
+    // the closed vision loop.
+    if (name === "playtest") {
+      const goal = (args && args.goal) || "";
+      const start = await runTool({ tool: "start_stop_play", arguments: { is_start: true } });
+      if (start.startsWith("ERROR")) return `ERROR: could not start play mode: ${start.slice(0, 160)}`;
+      A.playtest = true;
+      diag("playtest.start", { goal: goal.slice(0, 80) });
+      await sleep(2500); // let the game render before the first screenshot
+      const shot = await runTool({ tool: "screen_capture", arguments: {} });
+      const goalLine = goal ? ` The user wants to test: "${goal.trim()}".` : "";
+      return `Output of 'playtest':\nPlay mode is now ON.${goalLine} A screenshot of the running game is attached to this message - look at it, then drive the simulated player step by step with user_keyboard_input / user_mouse_input (datamodel_type:"Client" - auto-filled if omitted). After EVERY input VoidScript attaches a screenshot of the game so you can see the result; keep going until the scenario is covered. When done, call 'stop_playtest' to leave play mode, then fix anything the test revealed.`;
+    }
+    if (name === "stop_playtest") {
+      const stop = await runTool({ tool: "start_stop_play", arguments: { is_start: false } });
+      A.playtest = false;
+      diag("playtest.stop");
+      return stop.startsWith("ERROR")
+        ? `ERROR stopping play: ${stop.slice(0, 160)}`
+        : `Output of 'stop_playtest':\nPlay mode stopped. Review whether the playtest revealed any bugs, fix them, and continue.`;
+    }
+    // Virtual commands: named Lua macros (Feature: reusable snippets). The model
+    // saves a snippet once and re-runs it by name.
+    if (name === "save_macro") {
+      const mName = ((args && args.name) || "").trim();
+      const code = ((args && args.code) || "").trim();
+      if (!mName || !code) return 'ERROR: save_macro needs both "name" and "code".';
+      _macros[mName] = { code, desc: ((args && args.desc) || "").slice(0, 160), t: Date.now() };
+      persistMacros();
+      diag("macro.saved", { name: mName, len: code.length });
+      return `Output of 'save_macro':\nSaved macro "${mName}" (${code.length} chars). Run it later with {"command":"run_macro","params":{"name":"${mName}"}} or list saved ones with {"command":"list_macros"}.`;
+    }
+    if (name === "run_macro") {
+      const mName = ((args && args.name) || "").trim();
+      const m = _macros[mName];
+      if (!m) return `ERROR: no macro named "${mName}". Call {"command":"list_macros"} to see what is saved.`;
+      diag("macro.run", { name: mName, len: m.code.length });
+      return await runTool({ tool: "execute_luau", arguments: { code: m.code, datamodel_type: "Edit" } });
+    }
+    if (name === "list_macros") {
+      const names = Object.keys(_macros);
+      if (!names.length) return "Output of 'list_macros':\nNo macros saved yet. Create one with {\"command\":\"save_macro\",\"params\":{\"name\":\"...\",\"code\":\"...\"}}.";
+      return `Output of 'list_macros':\n${names.map((n) => `- ${n}${_macros[n].desc ? " - " + _macros[n].desc : ""}`).join("\n")}`;
+    }
+    // Snapshot the script's current source BEFORE a multi_edit, so revert_last
+    // can restore it. Skipped while revert_last() itself drives the write-back.
+    if (name === "multi_edit" && vsOn("vsRollback") && !_inRevert.on) {
+      await snapshotBeforeEdit(args);
+    }
+    // Destructive-action guard (Feature: safe agent, on by default). Block the
+    // few operations that are almost NEVER intended: clearing or destroying a
+    // WHOLE Roblox service / the game itself. Legit, scoped deletions of named
+    // instances are untouched. The system-prompt rule enforces the same thing
+    // as guidance; this makes it a hard stop so a slip can't nuke a place.
+    if (name === "execute_luau" && vsOn("vsGuardDestructive")) {
+      const code = (args.code || "") + "";
+      const m = BROAD_DELETE_RE.exec(code);
+      if (m) {
+        diag("guard.blocked", { match: m[0].slice(0, 40) });
+        return `ERROR: this execute_luau appears to ${m[0].includes("ClearAllChildren") ? "clear ALL children of" : "destroy"} ${(m[1] || "a place")} - VoidScript blocks that by default to protect the user's place. Make the action EXACT: name the specific instance(s) you want to affect (do NOT act on a whole service or the game). If you need to clear a container, point at that one container and only it, and say so explicitly. Verify scope first with inspect_instance if you are unsure, then retry with a precise, limited call.`;
+      }
+    }
+    // The Roblox MCP REQUIRES datamodel_type on execute_luau (enum Edit/Client/
+    // Server). The ###LUA### parser already fills it in, but the model may also
+    // write the JSON form without it - default to "Edit" so the call never
+    // soft-fails with "datamodel_type is required".
+    if (bareName === "execute_luau" && !args.datamodel_type) args.datamodel_type = "Edit";
+    // Pre-flight Luau syntax check: catch an obviously broken ###LUA### block
+    // here instead of paying the ~20s Studio call only to get a parse error.
+    if (bareName === "execute_luau") {
+      const preErr = preflightLuau(args.code || "");
+      if (preErr) {
+        diag("preflight.fail", { err: preErr.slice(0, 90) });
+        return preErr + "\n\nFix the reported issue and retry ONCE with corrected code - do not resend the same block.";
+      }
+    }
+    // Pre-flight shape check for multi_edit: the model can also pass edits in the
+    // JSON form, where a missing old_string/new_string would only surface as a
+    // delayed MCP complaint after a Studio round-trip.
+    if (bareName === "multi_edit") {
+      const edits = args.edits;
+      if (!Array.isArray(edits) || !edits.length) {
+        return 'ERROR calling \'multi_edit\': "edits" must be a non-empty array of {old_string, new_string} objects. Build the array correctly and retry.';
+      }
+      const bad = edits.findIndex((e) => !e || typeof e.old_string !== "string" || typeof e.new_string !== "string");
+      if (bad !== -1) {
+        return `ERROR calling 'multi_edit': edits[${bad}] is missing "old_string" and/or "new_string" (both are required strings). Fix it and retry.`;
+      }
+    }
+    // The player-input tools only run against the Client datamodel (play mode) and
+    // "Client" is the sole allowed value, so default it when the model omits it -
+    // it can only be right. (It still needs the game RUNNING; that's documented.)
+    if ((bareName === "user_keyboard_input" || bareName === "user_mouse_input") && !args.datamodel_type)
+      args.datamodel_type = "Client";
+    // ── Session command budget (Feature: vsCommandBudget) ───────────────────
+    // Once the per-session cap is reached, pause for a fresh grant so a runaway
+    // model cannot burn unlimited Studio calls. Resuming from the budget pause
+    // resets the counter (one grant = one batch of the configured size).
+    if (VS_CFG.vsCommandBudget > 0 && A.cmdBudgetHits >= VS_CFG.vsCommandBudget) {
+      A.budgetPaused = true;
+      A.paused = true;
+      diag("budget.exhausted", { hits: A.cmdBudgetHits, budget: VS_CFG.vsCommandBudget });
+      return `ERROR: the session command budget is reached (${A.cmdBudgetHits}/${VS_CFG.vsCommandBudget} commands) and the session is now PAUSED. STOP making tool calls - tell the user what was built so far and that a fresh batch is granted when they press Resume.`;
+    }
+    // ── Trust-level approval gate (Feature: vsTrustLevel) ───────────────────
+    // "low" confirms every command; "medium" confirms destructive ones (the
+    // loop separately pauses on errors for "medium"). "high" never confirms.
+    if (VS_CFG.vsTrustLevel !== "high" && !A.budgetPaused) {
+      const codeStr = (args.code || "") + "";
+      const destructive = BROAD_DELETE_RE.test(codeStr) || /(delete|destroy|clear_all_children|remove)/i.test(bareName);
+      const needApprove = VS_CFG.vsTrustLevel === "low" || (VS_CFG.vsTrustLevel === "medium" && destructive);
+      if (needApprove) {
+        sfx("ask");
+        if (!(await confirmGate({ tool: name, arguments: args }, destructive ? "a destructive command" : "this command"))) {
+          diag("confirm.declined", { tool: name });
+          return `ERROR: the '${name}' command was NOT run - the user did not approve it. Do not call it again until the user gives the go-ahead.`;
+        }
+      }
+    }
+    A.cmdBudgetHits++;
+    persistLastCommand(name, args);
+    const timeout = name === "execute_luau" ? 20000 : 120000;
+    // Hard watchdog: even if the background worker never answers, the loop
+    // gets a definitive result and continues.
+    const hardCap = new Promise((res) =>
+      setTimeout(() => res({ ok: false, kind: "timeout", error: "no response from the extension worker" }), timeout + 30000));
+    // Stop watcher: a blocking tool (e.g. wait_job_finished) would otherwise keep
+    // the loop awaiting the bridge for up to minutes, leaving the input locked and
+    // the Stop button stuck. When the user halts (A.stop), abandon the wait within
+    // ~150ms so the loop breaks and its finally unlocks everything. The in-flight
+    // bridge call may still finish in the background; its result is just ignored.
+    let stopTimer;
+    const stopWatch = new Promise((res) => {
+      stopTimer = setInterval(() => { if (A.stop) res({ ok: false, kind: "stopped" }); }, 150);
+    });
+    let r = await Promise.race([bg({ type: "call_tool", name, arguments: args, timeout }), hardCap, stopWatch]);
+    clearInterval(stopTimer);
+    if (r && r.kind === "stopped") return "(stopped by user)";
+    if (!r) return VS.FEEDBACK.bridgeOffline;
+    // The MCP server answers SUCCESSFULLY (ok:true) when no Studio is attached
+    // (Studio closed / no place / MCP option disabled) - with an explanatory
+    // text instead of a result. Surface it as a proper environment ERROR so the
+    // model stops and tells the user, instead of treating it as tool output.
+    if (r.ok && /Unable to find an active Studio instance|previously active Studio has disconnected|No Roblox Studio instances are connected|Unable to reach Roblox Studio|`studio_id` is not connected/i.test(r.text || "")) {
+      ui.banner("warn", "Roblox Studio is not connected",
+        "Open your place in Roblox Studio and enable the MCP server (Assistant AI → … → Manage MCP Servers → Enable Studio as MCP Server), then try again.");
+      return VS.FEEDBACK.studioOffline;
+    }
+    // The Roblox MCP reports missing/invalid required parameters as a SUCCESS
+    // whose text is just the complaint (e.g. "datamodel_type is required").
+    // Re-shape those into a real ERROR so the model corrects the call instead
+    // of misreading it as tool output.
+    if (r.ok && r.text && /^[\w .'"-]{0,60}\bis (required|not available|invalid)\b[\w .'"-]{0,80}$/i.test(r.text.trim())) {
+      return `ERROR calling '${name}': ${r.text.trim()}.\nA required or invalid parameter - check the command's parameters with list_commands, fix the call and retry.`;
+    }
+    // The Roblox MCP also reports Luau PARSE/RUNTIME errors as a SUCCESS whose
+    // text is the executor's own stack trace ("…ExecuteLuauTool:139: …
+    // CommandExecution:54: <real error>" - validated live). Genuine script
+    // output never contains those internal paths. Re-shape into a real ERROR so
+    // the model gets the fix-it hints below and the chip settles red, not ✓
+    // green - and strip the internal frames so only the useful part remains.
+    if (r.ok && bareName === "execute_luau" && r.text &&
+        /\b(?:ExecuteLuauTool|CommandExecution):\d+:/.test(r.text)) {
+      r = { ok: false, error: r.text.replace(/^(?:\S*(?:ExecuteLuauTool|CommandExecution):\d+:\s*)+/, "").trim() || r.text };
+    }
+    if (r.ok) {
+      if (r.images && r.images.length && !P.supportsVision) {
+        // Any tool from ANY connected server can turn out to return images -
+        // we don't try to predict this from its name in advance. This is the
+        // generic catch: whatever just ran, if it handed back images and this
+        // provider's model can't see them, refuse cleanly instead of silently
+        // attaching a file it will never actually process.
+        return `ERROR: '${bareName}' returned an image, but this assistant cannot see images. Do NOT call it again. Use a different command to get the information as text instead.`;
+      }
+      if (r.images && r.images.length) {
+        // Show the capture in a left-hand VoidScript popup (from the in-memory
+        // base64 - simple and reliable on every site; no DOM-embedded preview).
+        ui.showImages(r.images, name);
+        // Do NOT attach the image here: submitAndGetBase/typeAndSend types the
+        // feedback text into the editor LATER, and on providers whose editor is
+        // rebuilt via select-all + insertText (e.g. Gemini's setEditorText),
+        // that wipe severs the site's internal binding between "pending upload"
+        // and "message being composed" - the file then sits in the composer
+        // forever while only the text goes out (validated live: Gemini kept
+        // the file attached+unsent across the whole turn). Stash the images and
+        // let the provider attach them as the LAST step, right before the send
+        // click, so nothing mutates the editor afterward.
+        A.pendingImages = r.images;
+        diag("images.stashed", { count: r.images.length });
+        const caption = r.text && r.text.trim()
+          ? r.text.trim()
+          : `${r.images.length} image(s) captured.`;
+        return `Output of '${name}':\n${caption}\n(The image is attached to THIS message - you can see it directly. Analyse it and continue.)`;
+      }
+      const text = r.text && r.text.length ? r.text : "(tool returned an empty result)";
+      return `Output of '${name}':\n${text}`;
+    }
+    if (r.kind === "disconnected") return VS.FEEDBACK.bridgeOffline;
+    if (r.kind === "timeout") {
+      return `ERROR: tool '${name}' timed out after ${name === "execute_luau" ? 20 : 120}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
+    }
+    if (name === "execute_luau") {
+      const err = r.error || "";
+      const hint = err.includes("Failed to parse command code")
+        ? "Your code block was empty or the marker was wrong. Use exactly ###LUA### (three hashes) - never ###LUA---. The code must be between ###LUA### and ###END_LUA###."
+        : err.includes("attempt to") || err.includes("nil value")
+          ? "Lua runtime error. Check that the API you are calling exists (use game:GetService() to access services). Make sure you use 'return' to output values, not 'print()'."
+          : "Check your Lua syntax, make sure you use 'return' to output values (not 'print()'), and that all APIs you call exist in the current Roblox Studio context.";
+      return `ERROR in execute_luau: ${err}\n\n${hint}\n\nFix the code and retry.`;
+    }
+    return `ERROR calling '${name}': ${r.error}\nRead the error carefully, fix the call or try a different approach.`;
+  }
+
+  function argSummary(call) {
+    if (!call) return "";
+    if (call.tool === "execute_luau") {
+      const code = (call.arguments && call.arguments.code) || "";
+      const first = code.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+      return first.slice(0, 46);
+    }
+    const a = call.arguments || {};
+    const k = Object.keys(a)[0];
+    if (!k) return "";
+    let v = String(a[k]);
+    if (v.length > 34) v = v.slice(0, 31) + "…";
+    return `${k}: ${v}`;
+  }
+
+  // ── One-click build wizard (Feature): guided first-build prompt ────────────
+  // Composes the first user message the agent acts on after the bootstrap, so a
+  // single "Build it now" press produces a real playable first version.
+  function buildWizardPrompt(name, genre, mp) {
+    const g = genre || "obby";
+    const title = name || `My ${g} game`;
+    const genreLine = VS.PROJECT_TYPES[g];
+    let core = "Start with the core loop and build up from there:";
+    if (g === "obby") core = "Lay out the first few jump-accurate obstacles, add a checkpoint that respawns the player at the last checkpoint on fall, and a finish line.";
+    else if (g === "tycoon") core = "Add a per-player MoneyDropper feeding leaderstats.Coins, a rounder, and one purchasable upgrade.";
+    else if (g === "simulator") core = "Add click-to-collect drops, a rebirth/multiplier system, and per-player value storage.";
+    else if (g === "survival") core = "Add a server-side enemy wave spawner, a health bar with respawn, and a kill reward.";
+    else if (g === "racing") core = "Place a drivable VehicleSeat with a reset keybind and a checkpoint lap timer.";
+    else if (g === "shooter") core = "Add a gun (hitscan or projectile), ammo/reload, damage + score, and a respawn point.";
+    else if (g === "tower") core = "Add a base with lives, a wave spawner walking enemies along a Waypoint path, one tower that auto-targets the nearest enemy, and money per kill to buy more.";
+    else if (g === "rpg") core = "Add an NPC with a quest, XP + levels in leaderstats, a small inventory, and one simple combat loop.";
+    else if (g === "farming") core = "Add a tillable plot, a crop that grows over time, a harvest that pays money, and a small shop.";
+    else if (g === "escape") core = "Add one self-contained room with a locked door, a puzzle that opens it, and an item the player must find to win.";
+    else if (g === "horror") core = "Add a dark map, a monster NPC that chases the player, and a stamina bar - escaping the monster is the win condition.";
+    const mpLine = mp
+      ? "\nMake it multiplayer-ready: authoritative logic in ServerScriptService, per-player spawn/respawn handling, and a leaderboard."
+      : "";
+    return (
+      `Build the first playable version of ${title} - a Roblox ${g} game - right now.\n\n` +
+      `${core}\n${mpLine}\n\n` +
+      `Keep the scope to ONE solid, working slice: a player can spawn in, play the core loop, and see a clear result. ` +
+      `Test each system as you add it and fix anything that errors before moving on. ` +
+      `Genre guidance: ${genreLine.slice(0, 220)}`
+    );
+  }
+
+  // An MCP tool can report its OWN failure as a NORMAL result ("Output of '…':
+  // Error executing code: …") instead of our ERROR wrapper - so a
+  // startsWith("ERROR") test alone paints a FAILED call ✓ green and shows the
+  // error as its summary (seen live on Blender's execute_blender_code, and it
+  // will hit EVERY future MCP server the same way). Treat a result whose FIRST
+  // line opens with an error lead-in as failed too. Deliberately PHRASE-based,
+  // not the bare words "error"/"failed", so a genuine success line like
+  // "Failed: 0" / "Error count: 0" is NOT misread as a failure.
+  const BODY_ERR_RE =
+    /^\s*(error executing|error:|erreur|exception|traceback|communication error|failed to|could ?not|cannot |unable to|fatal)\b/i;
+  const stripOutputPrefix = (feedback) => feedback.replace(/^Output of '[^']*':\n?/, "");
+  function bodyLooksFailed(feedback) {
+    if (!feedback || feedback.startsWith("ERROR")) return false; // wrapper already flags it
+    const first = stripOutputPrefix(feedback).split("\n").map((s) => s.trim()).find(Boolean) || "";
+    return BODY_ERR_RE.test(first);
+  }
+  // True failure = OUR wrapper prefix OR an MCP tool's in-body error lead-in.
+  const feedbackIsError = (feedback) => feedback.startsWith("ERROR") || bodyLooksFailed(feedback);
+
+  function outSummary(feedback) {
+    if (!feedback) return "";
+    const isErr = feedbackIsError(feedback);
+    const body = stripOutputPrefix(feedback).trim();
+    if (!body) return "";
+    const all = body.split("\n").map((l) => l.trim()).filter(Boolean);
+    const lines = all.length;
+    // On SUCCESS, skip a leading non-fatal warning/note some MCP tools print
+    // before the real status so the chip shows the useful line, not the noise.
+    let first = all[0] || "";
+    if (!isErr && lines > 1 && /^(warning|warn|note|deprecat|info)\b/i.test(first)) {
+      first = all.find((l) => !/^(warning|warn|note|deprecat|info)\b/i.test(l)) || first;
+    }
+    first = first.slice(0, 44);
+    if (isErr) return first;
+    return lines > 1 ? `${first} · ${lines} lines` : first;
+  }
+
+  // Full args / code, shown in a tool chip's expandable body.
+  function callBody(call) {
+    const a = call.arguments || {};
+    if (call.tool === "execute_luau") return (a.code || "").trim();
+    try { return JSON.stringify(a, null, 2); } catch { return String(a); }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  AGENTIC LOOP
+  // ════════════════════════════════════════════════════════════════════════
+
+  // ── Auto-verify (closed-loop vision) ─────────────────────────────────────
+  // After a MUTATING tool succeeds, automatically run screen_capture so the
+  // model can SEE the result of its edit and self-correct ("does it look
+  // right? fix it if not") instead of proceeding blind. The captured image
+  // rides along on the SAME feedback message (A.pendingImages is consumed
+  // right after this runs). Off via VS_CFG.vsAutoVerify=false. Never runs
+  // when the provider's model cannot see images.
+  // Only tools that change what Studio SHOWS. A screenshot of a script edit (or of
+  // Lua that just reads or wires up logic) can't confirm anything, and each one
+  // costs a capture, an image upload into the chat and a slower model reply.
+  const AUTO_VERIFY_TOOLS = /^(execute_luau|generate_procedural_model|generate_mesh)$/;
+  const VISUAL_LUA = /Instance\.new|:Clone\(|\.(Position|Size|CFrame|Color|BrickColor|Material|Transparency|Orientation|Anchored)\s*=|:PivotTo\(/;
+  const PLAYTEST_INPUT_TOOLS = /^(user_keyboard_input|user_mouse_input)$/;
+  async function maybeAutoVerify(call, feedback) {
+    if (!vsOn("vsAutoVerify") || !P.supportsVision) return "";
+    const bare = bareToolName(call && call.tool);
+    const visual = bare !== "execute_luau" || VISUAL_LUA.test(String((call.arguments && call.arguments.code) || ""));
+    const want = (AUTO_VERIFY_TOOLS.test(bare) && visual) || (A.playtest && PLAYTEST_INPUT_TOOLS.test(bare));
+    if (!want) return "";
+    if (feedbackIsError(feedback)) return "";
+    const label = A.playtest && PLAYTEST_INPUT_TOOLS.test(bare) ? "playtest-step" : "after-edit";
+    diag("verify.autoStart", { after: bare, label });
+    const shot = await runTool({ tool: "screen_capture", arguments: {} });
+    if (shot.startsWith("ERROR")) {
+      diag("verify.failed", { after: bare, msg: shot.slice(0, 90) });
+      return "";
+    }
+    if (A.pendingImages && A.pendingImages.length) {
+      diag("verify.shot", { after: bare, label, count: A.pendingImages.length });
+      timeline("shot", { tool: bare, label });
+      A.shotCount = (A.shotCount || 0) + 1;
+      const lead = label === "playtest-step"
+        ? "screenshot of the game after your simulated input is attached - check what the player now sees; if the game state is wrong or broken, fix it before the next input."
+        : "screenshot of Roblox Studio right after your edit is attached - confirm the result actually looks right; if anything looks wrong, fix it and retry before moving on.";
+      return `\n\n[Auto-verify] VoidScript captured a ${lead}`;
+    }
+    return "";
+  }
+
+  async function agentLoop(base) {
+    if (A.running) return;
+    A.running = true;
+    A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
+    A.stop = false;
+    A.stopping = false; // clean slate: never inherit a stale "Stopping…" from a
+                        // Stop click that landed before this loop actually started
+    A.loopKey = null; // pinned by syncSessionState once this chat has an id + content
+    timeline("session_start", {});
+    A.runOk = 0; A.runErr = 0; A.shotCount = 0;
+    A.startedAt = Date.now();
+    A.undoSessionStart = _undoStack.length; // revert_session restores state to this boundary
+    let truncCount = 0;
+    const MAX_TRUNC = 6;
+    // Drift guard: track consecutive failures of the SAME command name. Once it
+    // hits 2, the loop proactively injects a targeted re-anchoring reminder with
+    // that command's exact name + signature before the next model turn - this
+    // stops Gemini (and others) from drifting off a command in long sessions
+    // and then looping the same "does not exist" error forever. Reset on any
+    // success or a different command.
+    let driftCmd = "", driftFails = 0;
+    // Re-send the command list after this many successful tool calls. Kept low
+    // (12) so the model doesn't drift off the exact Roblox command names in long
+    // sessions - the leading cause of Gemini "tool-dropoff" where the model
+    // claims a command "does not exist" after the 20-call interval that worked
+    // for short sessions left too wide a gap in marathon builds.
+    const REMIND_TOOLS_EVERY = 12;
+    const MAX_BATCH = 5; // commands the model may chain in one reply
+    ui.showStop(true);
+    P.setInputLock(true); // prevent user from typing while the agent is active
+    ui.inputCover(true);  // keep the "Agent is working" cover up for the WHOLE loop
+    diag("loop.start", { base });
+    try {
+      while (!A.stop) {
+        // Gate the WHOLE cycle on tab visibility. We only advance - read the
+        // reply, PARSE it, EXECUTE a tool, inject the result - while the AI tab
+        // is the FOREGROUND tab of its Edge window. document.visibilityState
+        // (mirrored by document.hidden) is the right signal, NOT window focus:
+        //  - Edge loses OS focus but the AI tab stays the active tab (user is
+        //    working in Roblox Studio) -> still "visible" -> the agent keeps
+        //    running, exactly as wanted.
+        //  - The AI tab is backgrounded (another tab in front) or the window is
+        //    minimized -> "hidden" -> pause here. Background tabs throttle
+        //    rendering/timers, which made DOM reads unreliable (misparse,
+        //    duplicate sends - see the send-side guard in submitAndGetBase).
+        // Parking here means we never START a parse/exec cycle off-screen; the
+        // send step re-checks too, so a switch-away mid-generation is covered.
+        // Manual Pause: park (like a hidden tab) until the user hits Resume.
+        if (A.paused && !A.stop) {
+          diag("loop.paused");
+          ui.inputCover(true);
+          while (!A.stop && A.paused) await sleep(250);
+          if (A.stop) break;
+          diag("loop.resumed");
+        }
+        if (document.hidden && !bgMode() && !A.stop) {
+          diag("loop.waitVisible");
+          ui.inputCover(true); // keep the "Agent is working" cover up while parked
+          if (!(await waitVisible()) || A.stop) break; // park (no cap) until foreground; break only on user stop
+          diag("loop.visibleAgain");
+        }
+        const res = await waitForResponse(base);
+        diag("response", { kind: res.kind });
+        if (A.stop || res.kind === "stopped") break;
+
+        if (res.kind === "context_limit") {
+          compactNow("context_limit");
+          break;
+        }
+        if (res.kind === "too_long") {
+          compactNow("too_long");
+          break;
+        }
+        if (res.kind === "timeout") {
+          ui.banner("warn", `No response from ${P.displayName}`,
+            `${P.displayName} did not respond in time. The loop has stopped.`);
+          break;
+        }
+        // A genuinely empty turn is effectively never produced (the warm-up guard
+        // waits out slow starts). It DOES happen when the site drops a reply, and
+        // ending the loop silently is what made this the single most confusing
+        // failure: the pending command just settles to a grey "not run" with no
+        // explanation anywhere. Say what happened.
+        if (res.kind === "empty") {
+          diag("empty.end");
+          ui.banner("warn", `${P.displayName} returned an empty reply`,
+            `The turn produced no text, so the agent loop stopped. Nothing was run. ` +
+            `Ask ${P.displayName} to continue, or press Start again in a new chat.`);
+          break;
+        }
+
+        // The turn stopped with the site's "Continue" affordance.
+        if (res.kind === "truncated") {
+          // If the turn carries the halted marker (a stop - user OR self-halt),
+          // respect it and do NOT auto-resume.
+          if (P.turnHalted(res.item)) { diag("truncated.halted"); break; }
+          // Otherwise it truncated by length → continue the SAME turn. Prefer
+          // the native Continue button; fall back to a continuation message.
+          if (truncCount < MAX_TRUNC) {
+            truncCount++;
+            if (P.clickContinueBtn() && await waitFor(() => P.isGenerating(), 2500)) {
+              diag("truncated.continued");
+              continue; // same turn resumes (base unchanged)
+            }
+            diag("truncated.sendFallback");
+            ui.toast("Reply was cut off, resuming…");
+            base = await submitAndGetBase(VS.FEEDBACK.truncated);
+            continue;
+          }
+          if (res.text) break; // give up resuming; keep what we have as the answer
+          ui.banner("warn", "Reply kept getting cut off",
+            "The model repeatedly hit its length limit. Try a shorter request or start a new session.");
+          break;
+        }
+        truncCount = 0;
+
+        if (res.kind === "parse_error") {
+          // The command turn ended in a parse error - it NEVER ran. Paint its chip
+          // as an error (owned, so the sweep won't repaint it the green ✓ "done" it
+          // stamps on any command-shaped turn once generation ends - the misleading
+          // "chip says OK, result says error" state seen live on GLM's truncated
+          // execute_blender_code).
+          const failName = VSParse.toolNameFromText(res.raw || "") || "command";
+          if (res.item) {
+            const detail = res.reason === "unclosed" ? "cut off"
+              : res.reason === "luaOpener" ? "missing ###LUA###"
+              : res.reason === "envelope" ? "bad format"
+              : "bad JSON";
+            decorate.toolBox(res.item, failName, "err", detail, true, "", VS.toolCategory(failName));
+          }
+          // Pass the detected command name so the feedback only offers the
+          // ###LUA### block when it actually applies (execute_luau) - never for a
+          // truncated/broken execute_blender_code or other JSON-only command.
+          base = await submitAndGetBase(VS.FEEDBACK.parseError(res.reason, failName));
+          continue;
+        }
+        if (res.kind === "text") { sfx("done"); break; } // final answer
+
+        if (res.kind === "tool") {
+          const calls = res.calls;
+          if (calls.length > MAX_BATCH) {
+            base = await submitAndGetBase(VS.FEEDBACK.multiTool(calls.map((c) => c.tool || "?")));
+            continue;
+          }
+          // Several independent commands in one reply: run all but the last here,
+          // in order, and stop at the first error. The last one goes through the
+          // normal path below, which sends every result back in ONE message - a
+          // round trip per batch instead of one per command. Approvals, the
+          // destructive guard and undo snapshots all live in runTool, so they
+          // still apply to each command.
+          let batchOut = "";
+          if (calls.length > 1) {
+            const outs = [];
+            rememberExecuted(res.item); // the auto-resume watchdog must never replay a batch
+            for (const c of calls.slice(0, -1)) {
+              decorate.toolBox(res.item, c.tool, "run", `${outs.length + 1}/${calls.length} · ${argSummary(c)}`, true, callBody(c), VS.toolCategory(c.tool));
+              A.toolRunning = true; A.toolStart = Date.now(); A.toolName = c.tool; A.toolItem = res.item; A.toolArg = argSummary(c);
+              const fb = await runTool(c);
+              A.toolRunning = false;
+              outs.push(fb);
+              diag("batch.step", { name: c.tool, ok: !feedbackIsError(fb), n: outs.length, of: calls.length });
+              if (A.stop || feedbackIsError(fb)) break;
+            }
+            batchOut = outs.join("\n\n") + "\n\n";
+            if (A.stop) {
+              if (res.item) { res.item.dataset.zStopped = "1"; rememberHalted(res.item); }
+              decorate.toolBox(res.item, calls[outs.length - 1].tool, "err", "stopped", true, "", VS.toolCategory(calls[outs.length - 1].tool));
+              break;
+            }
+            if (outs.length < calls.length - 1 || feedbackIsError(outs[outs.length - 1])) {
+              const skipped = calls.slice(outs.length).map((c) => c.tool).join(", ");
+              decorate.toolBox(res.item, calls[outs.length - 1].tool, "err", outSummary(outs[outs.length - 1]), true, stripOutputPrefix(outs[outs.length - 1]), VS.toolCategory(calls[outs.length - 1].tool));
+              base = await submitAndGetBase(batchOut + `(System note: that command failed, so the rest of your batch was skipped: ${skipped}. Fix it, then continue.)`);
+              continue;
+            }
+          }
+          const call = calls[calls.length - 1];
+          // A tool ALREADY seen to return an image this session gets the "screen"
+          // chip optimistically at run time (parity with the known screen_capture),
+          // even though its name alone wouldn't reveal it. First-ever call of an
+          // unknown image tool stays generic here and upgrades at result time below.
+          const learnedImg = A.imageTools.has(bareToolName(call.tool));
+          const category = learnedImg ? "screen" : VS.toolCategory(call.tool);
+          diag("tool.runCat", { name: call.tool, learnedImg, category });
+
+          // Park BEFORE painting the chip / stamping the clock / marking the turn
+          // dispatched. runTool() gates on visibility too (it is the choke point
+          // that also covers the bootstrap), but parking only there would leave
+          // this block's side effects applied for the whole minimize:
+          //   - the chip spins "running" while nothing actually runs, and
+          //     elapsedOn(vsToolT0) counts the parked time, so a 20-min minimize
+          //     renders a bogus "1200.0s" on the call;
+          //   - rememberExecuted() would mark the turn dispatched before it ever
+          //     ran, so a reload/close while parked loses the command for good -
+          //     the auto-resume watchdog refuses to re-fire an "executed" turn.
+          // Parking first keeps all of that truthful: we only commit once we are
+          // foreground and about to really dispatch.
+          if (document.hidden && !A.stop) {
+            diag("tool.parkBeforeDispatch", { name: call.tool });
+            if (!(await waitVisible()) || A.stop) break;
+          }
+          // Loading chip with the real args (loop owns this item from here).
+          decorate.toolBox(res.item, call.tool, "run", argSummary(call), true, callBody(call), category);
+          A.toolSettle = null; // a fresh call: no settled outcome yet
+          A.toolRunning = true;
+          A.toolStart = Date.now();
+          A.toolName = call.tool;
+          A.toolItem = res.item;
+          A.toolArg = argSummary(call);
+          // Record this turn as dispatched OFF the DOM so the auto-resume
+          // watchdog never re-fires it after a scroll re-render wipes the node's
+          // zloop/zResume markers (see the `executed` map).
+          rememberExecuted(res.item);
+          diag("tool.start", { name: call.tool });
+          const feedback = await runTool(call);
+          A.toolRunning = false;
+          diag("tool.done", { name: call.tool, ok: !feedback.startsWith("ERROR"), out: feedback.slice(0, 50) });
+          timeline("tool", { name: call.tool, ok: !feedback.startsWith("ERROR"), err: feedback.startsWith("ERROR") ? feedback.slice(0, 120) : "" });
+          if (feedback.startsWith("ERROR")) A.runErr = (A.runErr || 0) + 1; else A.runOk = (A.runOk || 0) + 1;
+          // Auto-screenshot on tool error (Feature: vsAutoShotError): capture the
+          // Studio screen so a vision-capable model can see the state that caused
+          // the failure before it retries. Skipped for "low" trust (which asks the
+          // user to approve every command - an unprompted screenshot would spam
+          // the approval flow).
+          if (feedback.startsWith("ERROR") && vsOn("vsAutoShotError") &&
+              P.supportsVision && VS_CFG.vsTrustLevel !== "low" && !A.stop) {
+            try {
+              const shot = await runTool({ tool: "screen_capture", arguments: {} });
+              if (!shot.startsWith("ERROR") && A.pendingImages && A.pendingImages.length) {
+                feedback += "\n\n(System note: a screenshot of the current Studio screen is attached to this message - it shows the state at the moment the error happened. Use it to diagnose before retrying.)";
+                diag("autoshot.taken", { tool: call.tool });
+              }
+            } catch {}
+          }
+          // Medium trust: pause for review when a command errored, so the user
+          // sees the failure before the model retries. Resume continues the loop.
+          if (feedback.startsWith("ERROR") && VS_CFG.vsTrustLevel === "medium" && !A.stop) {
+            A.paused = true;
+            diag("confirm.pauseOnError", { name: call.tool });
+            ui.banner("warn", "Command error - paused",
+              `${call.tool} errored. The agent will wait here. Press Resume to let it fix and continue, or Stop to end the session.`);
+          }
+          if (A.stop) {
+            // User halted mid-tool: settle the spinning chip so it doesn't look
+            // stuck loading forever, and MARK the turn so the sweep classifier
+            // never repaints it ✓ done once generation ends (the real cause of a
+            // stopped call still going green a moment later).
+            if (res.item) { res.item.dataset.zStopped = "1"; rememberHalted(res.item); }
+            decorate.toolBox(res.item, call.tool, "err", "stopped", true, "", category);
+            break;
+          }
+          const isErr = feedbackIsError(feedback);
+          const outBody = stripOutputPrefix(feedback);
+          // Trace the chip's DERIVED phase vs summary. Blender (and any MCP whose
+          // output leads with a warning/diagnostic line) resolves ✓ done - the
+          // payload starts "Output of…", not "ERROR" - yet outSummary shows its
+          // FIRST line, which is the warning. Captures firstLine vs a later
+          // success line so we can see the mismatch without guessing.
+          {
+            const lns = outBody.split("\n").map((l) => l.trim()).filter(Boolean);
+            diag("tool.result", { name: call.tool, isErr, phase: isErr ? "err" : "done",
+              summary: outSummary(feedback), lineCount: lns.length,
+              firstLine: (lns[0] || "").slice(0, 90), lastLine: (lns[lns.length - 1] || "").slice(0, 90) });
+          }
+          // A tool (Roblox OR any custom MCP server) that actually RETURNED an
+          // image becomes a "screen" chip - even if its name never let us guess.
+          // Reactive, not predictive: A.pendingImages is set by runTool before it
+          // returns. Remember the name so its next call is optimistic (see above).
+          const hasImages = !!(A.pendingImages && A.pendingImages.length);
+          if (hasImages) rememberImageTool(call.tool);
+          const resultCat = hasImages ? "screen" : category;
+          decorate.toolBox(res.item, call.tool, isErr ? "err" : "done", outSummary(feedback),
+            true, outBody, resultCat);
+          // Snapshot the settled outcome. If the site swaps this turn's DOM node
+          // while we wait for the model's next turn (wiping the chip AND the
+          // zloop ownership dataset), the sweep re-owns the fresh node with this
+          // outcome instead of letting branch-3 classification re-spin a "run"
+          // chip on an already-executed call.
+          A.toolSettle = {
+            phase: isErr ? "err" : "done", detail: outSummary(feedback),
+            body: outBody, category: resultCat, count: P.assistantCount(),
+            // Node IDENTITY of the settled turn (virtualization-proof), when the
+            // provider exposes it. The count guard alone misfires on Qwen: the
+            // list virtualizes so assistantCount() doesn't grow for the model's
+            // NEXT turn, and back-to-back calls to the SAME tool defeat the name
+            // guard too - the sweep then re-owned the STREAMING next turn's chip
+            // with the previous done/err outcome (seen live: 5x chip.reown with
+            // gen:true, rp tiny).
+            id: P.lastAssistantId ? P.lastAssistantId() : undefined,
+          };
+
+          // Re-inject the command list every REMIND_TOOLS_EVERY successful calls.
+          // Appended UNDER the tool result and clearly marked as a reminder, so a
+          // model that has drifted from the exact command names gets re-anchored
+          // without it looking like a new result to act on. Errors don't count
+          // (they already restate what's wrong) and list_commands is redundant.
+          let toSend = batchOut + feedback;
+          noteTokens("tool", feedback);
+          if (!isErr && call.tool !== "list_commands" && A.toolList.length) {
+            A.toolCallsSinceReminder++;
+            if (A.toolCallsSinceReminder >= REMIND_TOOLS_EVERY) {
+              A.toolCallsSinceReminder = 0;
+              // Scope the reminder to the primary Roblox server, exactly like
+              // list_commands: re-injecting EVERY connected server's tools (Blender
+              // etc.) merged flat would bloat the model's context - the opposite of
+              // what the model gets when it lists commands itself. Anti-drift only
+              // needs the primary Roblox set; addon commands were listed on demand
+              // and the bridge routes by name regardless.
+              const roblox = A.toolList.filter((t) => (t.server || "roblox") === "roblox");
+              toSend += VS.toolsReminder(roblox) + "\n" + VS.memoryNudge();
+              diag("tools.reminder", { after: REMIND_TOOLS_EVERY });
+            }
+          }
+          // Drift guard: track consecutive failures of the SAME command. After 2,
+          // the next re-injection carries a targeted re-anchor with just that
+          // command's exact name + signature, so the model stops "forgetting" it
+          // and looping the same error. Reset on success or a different command.
+          if (isErr) {
+            const bare = bareToolName(call.tool);
+            if (bare === driftCmd) {
+              driftFails++;
+            } else {
+              driftCmd = bare;
+              driftFails = 1;
+            }
+          } else {
+            driftCmd = ""; driftFails = 0;
+          }
+          const driftReanchor = (isErr && driftFails >= 2 && driftCmd === bareToolName(call.tool));
+          if (driftReanchor) {
+            const def = (A.toolList || []).find((t) => bareToolName(t.name) === driftCmd);
+            if (def) {
+              toSend += `\n\n(System note: you keep using "${driftCmd}" but it returns the same error. Here is its EXACT current signature - use it verbatim: ${def.name} with parameters ${JSON.stringify((def.inputSchema && def.inputSchema.properties) || {})}. This is a reminder only; do not re-inject this note.)\n`;
+              diag("drift.reanchor", { cmd: driftCmd });
+            }
+          }
+
+          const verifyNote = await maybeAutoVerify(call, feedback);
+          const images = A.pendingImages;
+          A.pendingImages = null;
+          diag("images.consumed", { count: images ? images.length : 0 });
+          base = await submitAndGetBase(toSend + verifyNote, images);
+          noteTokens("prompt", toSend + (verifyNote || ""));
+        }
+      }
+    } catch (e) {
+      diag("loop.error", { msg: String((e && e.message) || e) });
+      ui.banner("warn", "Internal loop error", String((e && e.message) || e));
+    } finally {
+      A.running = false;
+      A.stop = false;
+      // Keep the "Stopping…" state while the site's stream is still draining
+      // after a user stop: the loop often ends BEFORE the native stop takes
+      // effect (loop.end fires with gen still true - seen live on DeepSeek),
+      // and clearing the flag here let the next sweep restore a clickable
+      // "■ Stop" for the last beat of the dying stream (the Stopping… → Stop →
+      // gone bounce). The sweep's self-heal clears it - and retries the native
+      // stop - once the site is actually quiet.
+      const draining = A.stopping && A.started && P.isHardGenerating();
+      if (A.stopping && draining) diag("stop.drain", { keptStopping: true });
+      A.stopping = draining;
+      A.toolRunning = false;
+      A.toolSettle = null;
+      A.loopKey = null;
+      ui.showStop(false);
+      ui.inputCover(false); // lift the "Agent is working" cover when the loop ends
+      P.setInputLock(false); // always unlock, even on error or stop
+      diag("loop.end");
+      timeline("session_stop", {});
+      recordBuildResult();
+      // Completion summary toast: what actually happened this session, so the
+      // user gets closure even when the model itself never announces "done".
+      try {
+        const dur = A.startedAt ? fmtDur((Date.now() - A.startedAt) / 1000) : "";
+        const parts = [];
+        parts.push(`${A.runOk || 0} commands ok`);
+        if (A.runErr) parts.push(`${A.runErr} errors`);
+        if (A.shotCount) parts.push(`${A.shotCount} screenshots`);
+        parts.push(`in ${dur}`);
+        ui.toast("Session done · " + parts.join(" · "));
+        playChime(!!A.runErr);
+        // Session-end extras (Features): hidden-tab system notification, spoken
+        // completion, one-turn auto-summary, and auto-write of the build log.
+        if (vsOn("vsAutoNotify") && document.hidden) {
+          try {
+            chrome.runtime.sendMessage({
+              type: "notify",
+              title: "VoidScript session done",
+              message: parts.join(" · "),
+            }).catch(() => {});
+          } catch {}
+        }
+        if (vsOn("vsSpokenDone")) speakDone(A.runOk || 0, A.runErr || 0);
+        scheduleAutoSummary();
+        writeSessionLogToDisk(parts.join(" · "));
+        persistTokenTotals(sessionTokenEst());
+      } catch {}
+      A.startedAt = 0;
+      A.undoSessionStart = 0;
+      A.paused = false;
+    }
+  }
+
+  // Mark the current assistant turn as user-halted so the sweep classifier shows
+  // its command chip as "stopped" instead of repainting it ✓ done when
+  // generation ends. Cleared on a deliberate resume (native Continue).
+  //
+  // The dataset marker alone is NOT enough: sites re-render the whole history
+  // when the next user message lands (seen live on DeepSeek), replacing the
+  // halted turn's node and wiping dataset.zStopped - and since a fresh user
+  // message also clears the A.userStopped latch by design, nothing said
+  // "stopped" anymore and the chip went ✓ green. So halted turns are ALSO
+  // remembered here, keyed independently of the DOM node (conversation +
+  // position among assistant turns + a text prefix), and the sweep re-stamps
+  // the marker whenever the node was swapped.
+  const halted = new Map(); // "conv|turnKey" → text prefix at halt time
+  const assistantIdx = (item) => P.allItems().filter(P.isAssistantItem).indexOf(item);
+  // Virtualization-stable map key for the off-DOM executed/halted memories.
+  // assistantIdx is POSITIONAL within the currently-rendered window, so on a
+  // virtualized list (DeepSeek/Qwen/GLM/Arena) scrolling up renders a different
+  // set of turns and an OLD command turn takes a low index that COLLIDES with a
+  // current turn's key - the dedupe then misses and the watchdog re-fires the
+  // scrolled-back tool. Prefer the provider's stable per-turn id when it exposes
+  // one (P.itemKey); fall back to the index for non-virtualized providers.
+  const turnKey = (item) => {
+    if (P.itemKey) {
+      const k = P.itemKey(item);
+      if (k != null) return `k${k}`;
+    }
+    return String(assistantIdx(item));
+  };
+  function rememberHalted(item) {
+    try {
+      if (!item || assistantIdx(item) < 0) return;
+      const pref = (P.itemText(item) || "").slice(0, 60);
+      // A stop during the REASONING phase leaves the answer text EMPTY - an
+      // empty/short prefix would then startsWith-match ANY later turn at this
+      // index (seen live: a fresh streaming command went red "stopped" on the
+      // spot). Too little text to identify → rely on the dataset marker only.
+      if (pref.trim().length < 12) return;
+      halted.set(`${P.conversationKey()}|${turnKey(item)}`, pref);
+    } catch {}
+  }
+  function forgetHalted(item) {
+    if (!item || !halted.size) return;
+    try { halted.delete(`${P.conversationKey()}|${turnKey(item)}`); } catch {}
+  }
+  // The halt was recorded MID-stream, so the stored text is a PREFIX of the
+  // turn's final text - match on startsWith, never equality.
+  function isRememberedHalted(item, txt) {
+    if (!halted.size) return false;
+    try {
+      const pref = halted.get(`${P.conversationKey()}|${turnKey(item)}`);
+      return pref != null && (txt || "").startsWith(pref);
+    } catch { return false; }
+  }
+  function markStoppedTurn() {
+    const it = P.lastAssistant();
+    if (!it) return;
+    it.dataset.zStopped = "1";
+    rememberHalted(it);
+  }
+
+  // Off-DOM record of assistant turns whose command has ALREADY been dispatched
+  // (by the normal loop OR the auto-resume watchdog). The dataset markers that
+  // dedupe re-execution (zResume / zloop) live on the DOM NODE - but sites
+  // virtualize long conversations, so scrolling up DESTROYS and RECREATES a
+  // turn's node, wiping those markers. The fresh node then looks un-run, and the
+  // watchdog can re-fire the turn's tool with no live generation at all (the
+  // "tools execute when I scroll back" bug). Mirror the `halted` map exactly
+  // (keyed by conversation + assistant index + a text prefix, NOT the node) so
+  // the "already ran this" memory survives node recreation. This makes
+  // re-execution IDEMPOTENT regardless of any isGenerating/lastGenAt heuristic
+  // misfire - the hard part (is this a live turn?) can be wrong without harm.
+  const executed = new Map(); // "conv|turnKey" → text prefix at dispatch time
+  function rememberExecuted(item) {
+    if (!item) return;
+    try {
+      if (assistantIdx(item) < 0) return;
+      const pref = (P.itemText(item) || "").slice(0, 60);
+      // Same guard as rememberHalted: too little text to identify the turn (a
+      // command still streaming) would startsWith-match any later turn at this
+      // index. Fall back to the dataset marker until there is enough text.
+      if (pref.trim().length < 12) return;
+      executed.set(`${P.conversationKey()}|${turnKey(item)}`, pref);
+    } catch {}
+  }
+  function isRememberedExecuted(item, txt) {
+    if (!executed.size) return false;
+    try {
+      const pref = executed.get(`${P.conversationKey()}|${turnKey(item)}`);
+      return pref != null && (txt || "").startsWith(pref);
+    } catch { return false; }
+  }
+  function stopLoop() {
+    if (A.stopping) return; // already winding down - ignore double-clicks
+    diag("stopLoop");
+    A.stop = true;
+    A.stopping = true;
+    A.stopAt = Date.now(); // grace anchor for the regenerate-as-resume gates
+    // Baseline for the stop-retry growth gate (see the self-heal in the meter
+    // loop): a retry is only allowed if the reply keeps growing PAST this,
+    // proving the first stop click was swallowed. Without it, retries clicked a
+    // wedged (already-stopped) stop button and Gemini killed the NEXT turn.
+    A.stopStreamLen = P.streamLen ? P.streamLen() : 0;
+    A.userStopped = true; // suppress auto-resume until the next user message
+    A.resumeArmed = false; // a stop overrides any pending regenerate grace
+    clearLoopResume();     // a deliberate stop must never auto-resume after a reload
+    // Disarm any pending optimistic pre-hide (armed in submitAndGetBase for the
+    // feedback turn we just sent - see the re-arm note there). The input unlocks
+    // right after this function returns, but the window can still be open for a
+    // couple more seconds (e.g. mid-image-upload); without this, a message the
+    // user types fast right after Stop could be the "next new user turn" the
+    // window masks by mistake, instead of the (now abandoned) feedback turn.
+    A.injectHideUntil = 0;
+    markStoppedTurn();
+    // A tool's loading chip is only settled AFTER its `await runTool()` resolves
+    // (the if(A.stop) branch in agentLoop). A long-running call (e.g. a big
+    // multi_edit) leaves that await pending, so the chip would keep spinning for
+    // seconds after the user pressed Stop. Settle it to the stopped state right
+    // now; the loop's own settle on resolve is idempotent.
+    if (A.toolRunning && A.toolItem) {
+      A.toolItem.dataset.zStopped = "1";
+      rememberHalted(A.toolItem);
+      decorate.toolBox(A.toolItem, A.toolName, "err", "stopped", true, "", VS.toolCategory(A.toolName));
+    }
+    // Stopping during startup cancels it right away: the bootstrap may be parked
+    // on a reply that never comes, so don't wait for it to notice. Bumping
+    // startGen makes it bail at its next check without touching the UI again.
+    if (A.starting) {
+      A.startGen++;
+      A.starting = false;
+      A.startingKey = null;
+      ui.setStarting(false);
+      ui.inputCover(false);
+      P.setInputLock(false);
+    }
+    ui.markStopping();    // instant feedback: button → "⏳ Stopping…", disabled
+    P.stopGeneration();
+    ui.toast("Stopping…");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  SESSION BOOTSTRAP  ("Starting Up" animated chip, shown in the conversation)
+  // ════════════════════════════════════════════════════════════════════════
+  async function startSession() {
+    if (A.running || A.starting) return;
+    // "Start session" is allowed ONLY on a blank conversation. Opening an
+    // EXISTING conversation must never trigger the bootstrap.
+    if (!P.chatIsEmpty() && !A.started) {
+      ui.toast("Open a new, empty conversation to start a session.");
+      return;
+    }
+    A.userStopped = false;
+    A.stop = false;               // clear any halt left by a prior aborted bootstrap
+    // Snapshot any turn already on screen at session start (normally none on a
+    // clean new chat; on a reload-restored generation it's the stray turn). The
+    // auto-resume watchdog refuses to run a tool from this baseline turn so a
+    // restored execute_luau can't leak into the freshly started conversation.
+    A.bootBaselineId = P.lastAssistantId ? P.lastAssistantId() : null;
+    A.starting = true;
+    const myGen = ++A.startGen;   // identity of THIS bootstrap
+    A.startingKey = null;          // unknown until the conversation gets an id
+    const alive = () => A.startGen === myGen; // false once superseded/aborted
+    A.toolCallsSinceReminder = 0; // fresh reminder cadence for the new session
+    ui.setStarting(true);
+    ui.updateStartGate(); // refresh the bar into its "starting" state
+    P.setInputLock(true); // block user input during bootstrap
+    ui.inputCover(true);  // cover the composer ("Working…") for the WHOLE Starting Up
+    try {
+      await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
+                               // covers the list_commands / list_mcp_servers calls
+                               // the model makes seconds later)
+      if (!alive()) return;
+      if (!A.toolList.length) {
+        ui.banner("warn", "Bridge or Studio offline",
+          "Could not fetch Roblox tools. Run start.bat and make sure Roblox Studio is open, then try again.");
+        return;
+      }
+      // Let the provider apply the user's preferred model (if any) BEFORE it
+      // drives its composer into the default modes. No-op on providers without
+      // model logic (setPreferredModel is optional in the provider interface).
+      try { P.setPreferredModel && P.setPreferredModel(getPreferredModel(P.displayName)); } catch {}
+      const modeState = await P.ensureComposerReady("startup");      if (!alive()) return;
+      if (!modeState.ready) {
+        ui.banner("warn", `${P.displayName} mode not ready`,
+          `Could not switch ${P.displayName} to the required mode. Start a new chat or reload the page, then try again.`);
+        return;
+      }
+      // Reply language: the user's UI language (English = no instruction, prompt unchanged).
+      const replyLang = (VS_CFG.vsLang && VS_CFG.vsLang !== "en" && typeof VS_I18N !== "undefined") ? VS_I18N.aiName(VS_CFG.vsLang) : "";
+      const promptOpts = { siteName: P.displayName, customPrompt: ui.getCustomPrompt(), projectType: ui.getProjectType(), preferredModel: getPreferredModel(P.displayName), language: replyLang };
+      // Hand the model its command reference up front instead of letting it ask
+      // for list_commands - that saves a whole round trip before it's ready.
+      // Only while Roblox is actually up, and only if the combined paste stays a
+      // sensible size (big pastes are slow on some editors - see Gemini's cap).
+      let prompt = VS.buildSystemPrompt(promptOpts) + resumeNote();
+      const ref = await runTool({ tool: "list_commands", arguments: { _brief: true } });
+      if (!alive()) return;
+      if (!/OFFLINE|No commands available|^Output of '[^']*':\nERROR/.test(ref)) {
+        const withRef = VS.buildSystemPrompt({ ...promptOpts, commandRef: stripOutputPrefix(ref) }) + resumeNote();
+        if (withRef.length < 90000 && withRef.split("\n").length < 600) prompt = withRef;
+      }
+      diag("start.prompt", { inlineRef: prompt.includes("COMMAND REFERENCE"), len: prompt.length, lines: prompt.split("\n").length });
+      const base = await submitAndGetBase(prompt);
+      if (!alive()) return;
+      noteTokens("prompt", prompt);
+      // (syncSessionState pins A.startingKey to the conversation id once the chat
+      // has content, and aborts this bootstrap if the user opens a new empty chat.)
+      decorate.sweep(); // show the animated "Starting Up" chip immediately
+      const startRes = await waitForResponse(base);
+      if (!alive()) return;
+      // The user halted the bootstrap (our Stop or the site's native stop). Do
+      // NOT declare the session ready - abort quietly so "Start" stays available.
+      if (A.stop || startRes.kind === "stopped") { diag("start.aborted", { kind: startRes.kind }); return; }
+
+      // If the model calls list_commands as instructed, run it and wait for the "ready" reply.
+      const firstName = startRes.calls && startRes.calls[0] && startRes.calls[0].tool;
+      if (startRes.kind === "tool" && startRes.calls && startRes.calls.length === 1 &&
+          (firstName === "list_commands" || firstName === "list_tools")) {
+        decorate.toolBox(startRes.item, "Loading commands", "run", "", true);
+        const toolFeedback = await runTool(startRes.calls[0]);
+        // Roblox down short-circuits list_commands into a plain "offline" note
+        // (main.js, list_commands handler) instead of the real catalogue - detect
+        // that and show it as such, rather than the STALE cached tool count below
+        // (the bridge keeps advertising Roblox's catalogue even with no Studio
+        // attached, so A.toolList still has 25+ entries that were never actually
+        // usable this boot).
+        if (/Roblox Studio is currently OFFLINE/.test(toolFeedback)) {
+          decorate.toolBox(startRes.item, "Loading commands", "err", "Roblox offline", true);
+        } else {
+          // Count what the model ACTUALLY received: list_commands is scoped to the
+          // primary Roblox server (main.js ~629), so showing A.toolList.length (every
+          // connected server merged - Roblox + Blender + addons) overstated the boot
+          // count and made it look like all servers were loaded at once. Count the
+          // Roblox-scoped tools instead, matching the real result.
+          const robloxCount = A.toolList.filter((t) => (t.server || "roblox") === "roblox").length;
+          decorate.toolBox(startRes.item, "Loading commands", "done", `${robloxCount} commands`, true);
+        }
+        const base2 = await submitAndGetBase(toolFeedback);
+        const readyRes = await waitForResponse(base2); // wait for "I'm ready" reply
+        if (!alive()) return;
+        if (A.stop || readyRes.kind === "stopped") { diag("start.aborted", { kind: readyRes.kind }); return; }
+      }
+      A.started = true;
+      A.recovering = false;
+      rememberSession(P.conversationKey()); // survives virtualization AND reloads
+      ui.setStarted(true);
+      ui.toast(`Ready. ${P.displayName} is connected to Roblox Studio.`);
+      sfx("ready");
+      // Offer the build wizard on the very first start of the session.
+      // Context-compaction continuation: a previous chat hit the context limit and
+      // left a saved build handoff - seed it as the first message so the agent
+      // continues the build in this fresh chat instead of restarting from zero.
+      const handoffMsg = ui.takeCompactionHandoff();
+      if (handoffMsg && !A.stop) {
+        diag("compaction.continue", { len: handoffMsg.length });
+        const hbase = await submitAndGetBase(handoffMsg);
+        if (alive() && !A.stop) await agentLoop(hbase);
+        return;
+      }
+      // One-click build wizard: a pending guided starter prompt is auto-sent as
+      // the first user message, then the loop drives the build to completion.
+      const wizardMsg = ui.takeWizardPrompt();
+      if (wizardMsg && !A.stop) {
+        diag("wizard.prompt", { len: wizardMsg.length });
+        const wbase = await submitAndGetBase(wizardMsg);
+        if (alive() && !A.stop) await agentLoop(wbase);
+        return;
+      }
+    } catch (e) {
+      if (alive()) ui.banner("warn", "Startup failed", String((e && e.message) || e));
+    } finally {
+      // Only tear down our OWN starting state. If we were superseded (the user
+      // opened another chat), the newer flow / syncSessionState owns it now.
+      if (alive()) {
+        A.starting = false;
+        A.startingKey = null;
+        ui.setStarting(false);
+        ui.inputCover(false); // lift the Starting Up composer cover
+        P.setInputLock(false); // always unlock after bootstrap
+        decorate.sweep();
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  SVG ICON SET  (stroke = currentColor, inherits the chip's theme colour)
+  // ════════════════════════════════════════════════════════════════════════
+  const SVG = (p) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  const ICONS = {
+    screen:  SVG('<rect x="3" y="4" width="18" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>'),
+    roblox:  SVG('<path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/>'),
+    read:    SVG('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>'),
+    edit:    SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'),
+    generate: SVG('<path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/>'),
+    tool:    SVG('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2-2z"/>'),
+    result:  SVG('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'),
+    check:   SVG('<polyline points="20 6 9 17 4 12"/>'),
+    error:   SVG('<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>'),
+    gear:    SVG('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-2.82 1.17V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15H4.5a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 6 8a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 11 4.6h.09A1.65 1.65 0 0 0 12 3.09 2 2 0 0 1 16 3v.09A1.65 1.65 0 0 0 19 4.6l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 21.4 11h.1a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.5 1z"/>'),
+  };
+  const SPIN = '<span class="vs-spin"></span>';
+
+  function iconFor(category, phase) {
+    if (phase === "run") return SPIN;
+    if (phase === "err") return ICONS.error;
+    if (phase === "done") return ICONS.check;
+    if (phase === "result") return ICONS.result;
+    if (phase === "sys") return ICONS.gear;
+    return ICONS[category] || ICONS.tool;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  CAMOUFLAGE / DECORATION  (chips are real "tool cards": header + an
+  //  expandable body, themed by tool category and execution state)
+  // ════════════════════════════════════════════════════════════════════════
+
+  // Strip every trace of our decoration from a node. Needed because sites
+  // virtualize (recycle) turn nodes: a node that was a command/result card can
+  // be reused to render unrelated text.
+  function resetDecoration(item) {
+    const chip = item.querySelector(".vs-chip");
+    if (chip) chip.remove();
+    item.classList.remove("vs-hidden");
+    item.querySelectorAll(".vs-tool-hide").forEach((e) => e.classList.remove("vs-tool-hide"));
+    item.querySelectorAll(".vs-cmd-mask").forEach((e) => e.classList.remove("vs-cmd-mask"));
+    delete item.dataset.vs;
+    delete item.dataset.vsig;
+    delete item.dataset.zphase;
+    delete item.dataset.zStopped;
+    delete item.dataset.zRegenLen;
+    delete item.dataset.zRegenAt;
+    delete item.__vsChip;
+  }
+
+  const decorate = {
+    // Core renderer. opts: {label, detail, body, category, phase, cls, whole}
+    chip(item, opts) {
+      const { label, detail = "", body = "", category = "tool", phase, cls, whole } = opts;
+      let chip = item.querySelector(".vs-chip");
+      const hasBody = !!body;
+      // While a command streams, the site re-renders the raw block on every token
+      // and we get called on nearly every sweep. If what we'd draw is identical,
+      // we must NOT rebuild the chip's innerHTML: doing so re-creates the
+      // <span class="vs-spin"> and restarts its CSS animation each time, so the
+      // spinner looks frozen / stutters ("retry en rafale"). Rebuild the inner
+      // markup ONLY when the rendered content actually changes; otherwise reuse
+      // the existing element (and keep its expand/collapse state) so the spinner
+      // keeps spinning smoothly. Re-anchoring + masking below still run each pass.
+      const sig = `${category}|${phase}|${cls || ""}|${whole ? 1 : 0}|${label}|${detail}|${hasBody ? body.length : 0}`;
+      if (!chip) chip = document.createElement("div");
+      if (chip.dataset.csig !== sig) {
+        chip.dataset.csig = sig;
+        chip.className = `vs-chip cat-${category} ${cls || ""}`;
+        chip.innerHTML =
+          `<div class="vs-chip-head">` +
+            `<span class="vs-chip-ic">${iconFor(category, phase)}</span>` +
+            `<span class="vs-chip-tx"></span>` +
+            `<span class="vs-chip-dt"></span>` +
+            (hasBody ? `<span class="vs-chip-cv">${SVG('<polyline points="6 9 12 15 18 9"/>')}</span>` : "") +
+          `</div>` +
+          (hasBody ? `<div class="vs-chip-body"><pre></pre></div>` : "");
+        chip.querySelector(".vs-chip-tx").textContent = label;
+        if (detail) chip.querySelector(".vs-chip-dt").textContent = detail;
+        if (hasBody) {
+          chip.querySelector(".vs-chip-body pre").textContent = body;
+          const head = chip.querySelector(".vs-chip-head");
+          head.style.cursor = "pointer";
+          head.onclick = () => chip.classList.toggle("open");
+        }
+      }
+
+      if (whole) {
+        // Fully injected turn (result / sys) → hide the whole item.
+        if (chip.parentElement !== item) item.insertBefore(chip, item.firstChild);
+        item.classList.add("vs-hidden");
+      } else {
+        item.classList.remove("vs-hidden");
+        // findToolBlockSpot ALSO applies the .vs-tool-hide classes (its real job);
+        // we call it for that even when we don't use its returned position.
+        const spot = P.findToolBlockSpot(item, chip);
+        if (P.chipAtItemLevel) {
+          // Site re-renders the turn's content subtree (Angular/Gemini), which
+          // wipes any chip placed INSIDE it. Anchor the chip at the turn-element
+          // level instead, where it survives those re-renders; the hide classes
+          // (re-applied by the sweep) handle masking the raw block.
+          // A provider may supply chipAnchor(item) to redirect the chip into a
+          // descendant (e.g. Kimi's turn is a flex ROW [avatar | content];
+          // inserting at item.firstChild would make the chip the avatar's flex
+          // sibling and shove the layout sideways, so it anchors in the content
+          // column instead). Default: the turn root.
+          const anchor = (P.chipAnchor && P.chipAnchor(item)) || item;
+          // Default: pin the chip as the FIRST child - simple and immune to the
+          // site re-appending fresh content later. A provider may opt into
+          // `chipAppend` to place it LAST instead (reads in the model's actual
+          // order: narration, then the tool call it wrote at the end of the
+          // turn). `chipTrailRef(item)` lets it name a fixed trailing sibling
+          // (e.g. Qwen's action-buttons row) the chip must stay BEFORE even
+          // when "last" - see ensureOwnedChip's drift check for why this needs
+          // upkeep that firstChild pinning never did.
+          const wantLast = !!P.chipAppend;
+          const trailRef = wantLast && P.chipTrailRef ? P.chipTrailRef(item) : null;
+          const inPlace = chip.parentElement === anchor &&
+            (wantLast ? chip.nextElementSibling === trailRef : anchor.firstElementChild === chip);
+          if (!inPlace) {
+            if (wantLast) anchor.insertBefore(chip, trailRef); // trailRef=null -> append
+            else anchor.insertBefore(chip, anchor.firstChild);
+          }
+        } else if (spot) {
+          spot.parent.insertBefore(chip, spot.ref);
+        } else if (!chip.parentElement) {
+          item.insertBefore(chip, item.firstChild);
+        }
+      }
+      item.dataset.vs = cls || "1";
+      // Remember the exact opts so a chip wiped by a site re-render can be
+      // rebuilt identically (see ensureOwnedChip / the chipGone guards).
+      item.__vsChip = { ...opts };
+      return chip;
+    },
+
+    // Re-apply a loop-owned chip after a site re-render wiped it (chip removed
+    // and/or the .vs-tool-hide classes stripped). The loop owns the label/phase,
+    // so we rebuild from the stored opts rather than re-running classification.
+    ensureOwnedChip(item) {
+      const opts = item.__vsChip;
+      if (!opts) return;
+      const chipEl = item.querySelector(".vs-chip");
+      const chipGone = !chipEl;
+      let rawVisible = false;
+      if (!opts.whole) {
+        // NOTE the thinking exclusion: reasoning models QUOTE the command
+        // JSON/###LUA### in their think area, which the camouflage never hides
+        // (by design) - counting those as "raw block visible" made this
+        // rebuild fire on EVERY sweep forever (60Hz spam, seen live).
+        rawVisible = [...item.querySelectorAll("pre, p, [class*='code'], .cm-line")].some(
+          (e) => !e.closest(".vs-tool-hide") && !e.closest(".vs-chip") &&
+                 !(P.thinkingSel && e.closest(P.thinkingSel)) &&
+                 // Some sites (Arena) wrap a code block in a bare outer <pre>
+                 // that has no hide class of its own - the real content (and
+                 // the .vs-tool-hide class) live on a child wrapper instead.
+                 // closest() only checks ancestors, so without this the outer
+                 // <pre> reads as "raw command visible" FOREVER (its own
+                 // textContent includes the hidden child's text), causing an
+                 // infinite rebuild loop (~60/s, seen live on Arena).
+                 !e.querySelector(".vs-tool-hide") &&
+                 VSParse.hasCommandShape(e.textContent || ""));
+      }
+      // A provider opted into `chipAppend` (chip trails the reply text instead
+      // of pinning first) has no equivalent of firstChild's immunity to churn:
+      // a site re-render can re-append fresh reply content AFTER our chip,
+      // silently shoving it back above the text it was meant to trail. Catch
+      // that drift too, not just an outright wipe - it's cheap (one property
+      // read) and only applies to opted-in providers (Qwen).
+      let drifted = false;
+      if (!opts.whole && !chipGone && P.chipAtItemLevel && P.chipAppend) {
+        const anchor = (P.chipAnchor && P.chipAnchor(item)) || item;
+        const trailRef = P.chipTrailRef ? P.chipTrailRef(item) : null;
+        drifted = chipEl.parentElement === anchor && chipEl.nextElementSibling !== trailRef;
+      }
+      if (chipGone || rawVisible || drifted) {
+        // Tracker: the site wiped a loop-owned chip (re-render/node churn).
+        diag("chip.rebuild", { name: opts.label, phase: opts.phase, chipGone, rawVisible, drifted });
+        this.chip(item, opts);
+      }
+    },
+
+    // owned=true → the agentic loop manages this item; the observer backs off.
+    toolBox(item, name, phase, detail, owned, body, category) {
+      if (!item) return;
+      // Tracker: every phase TRANSITION of a command chip, with who drove it.
+      // "loop" = the agentic loop (authoritative), "sweep" = DOM classification.
+      if (item.dataset.zphase !== phase) {
+        diag("chip.phase", {
+          name, from: item.dataset.zphase || "(new)", to: phase,
+          by: owned ? "loop" : "sweep", detail: detail || "",
+        });
+      }
+      const cls = phase === "run" ? "run" : phase === "err" ? "err" : phase === "idle" ? "idle" : "done";
+      this.chip(item, {
+        label: name, detail: detail || "", body: body || "",
+        category: category || VS.toolCategory(name), phase, cls,
+      });
+      item.dataset.zphase = phase;
+      if (owned) item.dataset.zloop = "1";
+    },
+
+    classify(item, next) {
+      if (item.dataset.zloop) { this.ensureOwnedChip(item); return; } // loop owns it
+      const txt = P.classifyText(item, ".vs-chip"); // excludes thinking AND our chip
+
+      // NOTE on the "needs re-apply" guards below: some sites (Gemini/Angular)
+      // re-render a turn's CHILDREN on every update - our chip and the
+      // .vs-tool-hide classes are wiped while the dataset flags on the turn
+      // element itself survive. So "already decorated" must always be
+      // double-checked against the chip actually being present in the DOM.
+      const chipGone = !item.querySelector(".vs-chip");
+
+      // 1. System-prompt bootstrap turn → animated while starting, gear when done.
+      if (txt.includes(VS.SYS_MARKER)) {
+        const phase = A.starting ? "run" : "sys";
+        if (item.dataset.vs !== "sys" || item.dataset.zphase !== phase || chipGone) {
+          this.chip(item, { label: "Starting Up", category: "tool", phase, cls: "sys", whole: true });
+          item.dataset.zphase = phase;
+        }
+        return;
+      }
+
+      // 2. Injected result / ERROR / note turns. ALWAYS a user turn we sent,
+      //    keyed off our fixed output shapes (never command keywords).
+      if (P.isUserItem(item) && VSParse.isInjectedFeedback(txt)) {
+        const m = txt.match(/Output of '([^']+)'/);
+        const isErr = /^\s*ERROR\b/.test(txt);
+        // Reload-proof image detection: a feedback carrying an image ends with the
+        // IMAGE_FEEDBACK_RE marker. Learn the tool (persisted) so its command turn
+        // above AND its next call get the "screen" chip even with no loop running.
+        const hasImg = !isErr && IMAGE_FEEDBACK_RE.test(txt);
+        if (hasImg && m) rememberImageTool(m[1]);
+        const sig = (m ? m[1] : "note") + "|" + (isErr ? "err" : hasImg ? "img" : "result");
+        if (item.dataset.vsig !== sig || !item.classList.contains("vs-hidden") || chipGone) {
+          this.chip(item, {
+            label: m ? `${m[1]} · result` : "result",
+            category: hasImg ? "screen" : m ? VS.toolCategory(m[1]) : "tool",
+            body: txt, phase: isErr ? "err" : "result",
+            cls: isErr ? "err" : "result", whole: true,
+          });
+          item.dataset.vsig = sig;
+        }
+        return;
+      }
+
+      // 2b. FALLBACK for a command turn whose raw tool-call text is no longer
+      // readable (e.g. Qwen disposes/never fully renders an off-screen Monaco
+      // code block on a COLD page load - the dataset.vsCode cache only helps
+      // WITHIN a session, since it needs to observe the block live to capture
+      // it before disposal; reported live: every past tool-call chip vanished
+      // after a page reload, leaving only its "· result" box). The turn's own
+      // text no longer "looks like" a command, but the VERY NEXT turn being
+      // our injected result (`Output of 'name'`) is definitive proof it WAS
+      // one - settle it from that evidence instead of leaving the chip gone.
+      if (P.isAssistantItem(item) && !VSParse.hasCommandShape(txt) &&
+          next && P.isUserItem(next)) {
+        const nt = P.classifyText(next, ".vs-chip");
+        const m = nt.match(/^\s*Output of '([^']+)'/);
+        if (m) {
+          const isErr = /^\s*ERROR\b/.test(nt);
+          const phase = isErr ? "err" : "done";
+          if (item.dataset.zphase !== phase || chipGone) {
+            this.toolBox(item, m[1], phase, "", false);
+          }
+          return;
+        }
+      }
+
+      // 3. Assistant command turns → live loading while streaming, ✓ when done.
+      // ONLY in a real VoidScript session (started or bootstrapping). Without
+      // this gate, a plain never-started chat where the model merely EXPLAINS
+      // the command format (a {"command":...} example in its answer) got the
+      // example MASKED behind a tool chip - hiding genuine content the user
+      // asked for. Same principle as domHasVsSignal: a command shape alone is
+      // not proof of a session. (Branches 1/2 above key off OUR OWN injected
+      // markers, which only exist in real sessions, so they need no gate.)
+      if (P.isAssistantItem(item) && VSParse.hasCommandShape(txt) &&
+          (A.started || A.starting)) {
+        // Regenerate transition (see zRegenLen capture in regenResume): the site is
+        // still showing the OLD command text after a post-stop regenerate, before it
+        // wipes and re-streams. Keep the coherent red "stopped" look instead of
+        // re-animating the stale old call as a fresh "run" spinner. Clears the moment
+        // the content is actually replaced (stream length drops below the captured
+        // baseline) or a short safety window elapses, after which normal
+        // classification paints the freshly regenerated command.
+        if (item.dataset.zRegenLen) {
+          const baseLen = Number(item.dataset.zRegenLen);
+          const armedAt = Number(item.dataset.zRegenAt || 0);
+          const replaced = txt.length < baseLen - 8;      // old content wiped
+          const expired = Date.now() - armedAt > 6000;    // safety fallback
+          if (!replaced && !expired) {
+            const nm = VSParse.toolNameFromText(txt) || "command";
+            this.toolBox(item, nm, "err", "stopped", false);
+            return;
+          }
+          delete item.dataset.zRegenLen;
+          delete item.dataset.zRegenAt;
+        }
+        // A turn the user manually halted (Stop / native stop) stays "stopped" -
+        // never let this sweep repaint it ✓ done (or worse, re-spin it) just
+        // because generation is still settling. The dataset marker is set where we
+        // halt, but on Arena the A/B carousel re-renders the turn node on every
+        // token, wiping the marker - so the spinner came back even after Stop. Also
+        // derive "stopped" from the userStopped latch (which survives node swaps)
+        // for the last turn; it's cleared on the next user message / deliberate
+        // resume, so a settled turn is never falsely frozen later.
+        // A turn that is GENERATING again (or whose tool the loop is actively
+        // running), with NO active user-stop latch, has been REGENERATED - it is no
+        // longer the halted turn. Clear its stale halt so isRememberedHalted (index
+        // + text-prefix based) can't keep repainting the FRESH command red: a Gemini
+        // regenerate reuses the same assistant index and a similar opening prefix,
+        // so the old halt otherwise matches and the running command shows "stopped"
+        // (red) until it settles. Gated on !A.userStopped so a real Stop that is
+        // still settling (isGenerating can lag true for a beat) is NEVER cleared.
+        const regenerating = !A.userStopped && (
+          (item === P.lastAssistant() && P.isGenerating()) ||
+          (A.running && A.toolItem === item)
+        );
+        if (regenerating) { delete item.dataset.zStopped; forgetHalted(item); }
+        const stopped = !regenerating && (
+          item.dataset.zStopped === "1" ||
+          (A.userStopped && item === P.lastAssistant()) ||
+          isRememberedHalted(item, txt));
+        // Self-heal: a site re-render that swapped this turn's node wiped the
+        // dataset marker - re-stamp it so the stop survives the next wipe of
+        // the A.userStopped latch (a fresh user message clears it by design).
+        if (stopped && item.dataset.zStopped !== "1") {
+          item.dataset.zStopped = "1";
+          diag("chip.rehalt", { name: VSParse.toolNameFromText(txt) });
+        }
+        // The loop already SETTLED this very call (tool finished, we're waiting
+        // for the model's next turn) but the site swapped the turn's DOM node,
+        // wiping the chip, the zloop ownership AND the __vsChip opts. Without
+        // this, the fresh node re-classifies as a spinning "run" chip (A.running
+        // is still true) on an already-executed call. Re-own it with the settled
+        // outcome. The count guard skips this once the model's NEXT turn exists,
+        // so a follow-up call to the same tool still classifies live.
+        if (!stopped && A.running && !A.toolRunning && A.toolSettle &&
+            // Same TURN check. Node identity when available (virtualization-proof:
+            // on Qwen the count doesn't grow for a new turn, and a back-to-back
+            // call to the same tool defeats the name guard - the old outcome then
+            // repainted the STREAMING next turn's chip as done/err). Falls back to
+            // the count guard for providers without lastAssistantId.
+            (A.toolSettle.id !== undefined && P.lastAssistantId
+              ? P.lastAssistantId() === A.toolSettle.id
+              : A.toolSettle.count === P.assistantCount()) &&
+            item === P.lastAssistant() &&
+            VSParse.toolNameFromText(txt) === A.toolName) {
+          diag("chip.reown", { name: A.toolName, phase: A.toolSettle.phase });
+          this.toolBox(item, A.toolName, A.toolSettle.phase, A.toolSettle.detail,
+            true, A.toolSettle.body, A.toolSettle.category);
+          return;
+        }
+        // Is this command turn the IN-FLIGHT call - the one a running loop or the
+        // bootstrap is about to own? The tell: it has NO injected result turn after
+        // it yet. Every ALREADY-EXECUTED command turn is followed by its injected
+        // result (a user turn matching isInjectedFeedback), so keying off that,
+        // rather than item === lastAssistant(), robustly separates the in-flight
+        // turn from settled history. This gives us the best of both:
+        //  - The Kimi/bootstrap flash fix: while a loop/bootstrap is active, the
+        //    in-flight turn stays "run" in the window between generation ending and
+        //    the loop painting its own chip, WITHOUT depending on the flickery
+        //    lastAssistant() (Kimi's Vue swaps the node) - no premature green flash.
+        //  - No re-spin on REVISIT: when a started chat is re-opened and the loop
+        //    or bootstrap runs again, every PAST command turn already has its result
+        //    below it, so it settles to "done" instead of every old chip re-loading
+        //    to a blue spinner (the Arena "all chips restarted loading" report).
+        const resultAfter = next && P.isUserItem(next) &&
+          VSParse.isInjectedFeedback(P.classifyText(next, ".vs-chip"));
+        const inFlight = (A.running || A.starting) && !resultAfter;
+        // Regenerate grace: keep the freshly-regenerated command turn "run" in the
+        // gap between regenResume clearing the stop latch and the watchdog starting
+        // the loop, so it never flashes a premature ✓ "done" (see regenResume). The
+        // anchor slides with generation and expires ~2.5s after it truly stops.
+        const resumeGrace = A.resumeArmed && item === P.lastAssistant() &&
+          Date.now() - (A.resumeArmedAt || 0) < 2500;
+        const live = !stopped && (
+          inFlight || resumeGrace || (item === P.lastAssistant() && P.isGenerating())
+        );
+        // Orphaned command: a COMPLETE command turn that is the last assistant with
+        // NO result below it, not live and not loop-owned, whose generation is now
+        // stale (typically the page/extension was reloaded while this command sat
+        // un-executed). The auto-resume watchdog deliberately refuses to run a
+        // reload-restored generation (the "execute_luau leaked into the new chat"
+        // leak guard - same lastGenAt staleness test used here), so it will NEVER
+        // execute. Painting it a green ✓ "done" falsely implies the tool ran and
+        // succeeded; show a neutral, greyed "not run" state instead (cosmetic only -
+        // we intentionally do NOT auto-execute it).
+        // A command turn we have no evidence ever executed: not loop-owned, no
+        // injected result below it, and not in the off-DOM executed memory (the
+        // memory keeps this virtualization-safe - a scrolled-back turn whose result
+        // detached is still known-executed and never mislabelled).
+        const neverRun = !item.dataset.zloop && !resultAfter &&
+          !isRememberedExecuted(item, txt);
+        // Superseded orphan: abandoned command - a NEWER assistant turn exists below
+        // it yet it never ran (e.g. stopped then regenerated into a fresh turn on
+        // Qwen). It will never execute, so it must show neither a green ✓ "done" NOR
+        // a live spinner. inFlight is not turn-specific: with the loop running the
+        // NEW turn, this old no-result turn would otherwise also read as "run" - the
+        // "both the old and the new chip spinning at once" seen live.
+        const supersededOrphan = neverRun && item !== P.lastAssistant();
+        // Reload orphan: the LAST command turn, not live, whose generation is stale -
+        // the page/extension was reloaded while it sat un-executed and the watchdog
+        // refuses to run a reload-restored generation (leak guard). Also never a
+        // false green ✓; show a neutral, greyed "not run" (we do NOT auto-execute it).
+        const staleLastOrphan = neverRun && item === P.lastAssistant() && !live &&
+          Date.now() - A.lastGenAt > 8000;
+        const orphanPending = !stopped && (supersededOrphan || staleLastOrphan);
+        // Handoff window: a JUST-finished last-assistant command with no result yet
+        // that the loop has not taken over (A.running not yet true, so `live` is
+        // false). Without this it flashes a premature ✓ "done" for the frames
+        // between generation ending and the loop starting, THEN re-spins when the
+        // loop paints its own chip - most visible on the instant virtual commands
+        // (list_mcp_servers/list_commands). Keep it spinning instead; staleLastOrphan
+        // takes over after 8s if the loop genuinely never runs it.
+        const pendingExec = !stopped && !orphanPending && !live &&
+          neverRun && item === P.lastAssistant() && Date.now() - A.lastGenAt <= 8000;
+        let phase = stopped ? "err" : (orphanPending ? "idle" : ((live || pendingExec) ? "run" : "done"));
+        let detail = stopped ? "stopped" : (orphanPending ? "not run" : "");
+        // Error-aware settle: a command whose injected result RIGHT BELOW is an
+        // ERROR must never wear a green ✓. The loop paints this correctly while
+        // it owns the turn, but a revisited conversation (or a node swap that
+        // dropped ownership) re-derives the phase here - from the conversation
+        // itself, so it stays correct without any loop state.
+        if (phase === "done" && next && P.isUserItem(next)) {
+          const nt = P.classifyText(next, ".vs-chip");
+          // feedbackIsError also catches an MCP tool's in-body error (the result
+          // reads "Output of '…': Error executing code…", which our ERROR prefix
+          // test would miss - the Blender case), so a revisited conversation
+          // re-settles it red, matching what the loop painted live.
+          if (VSParse.isInjectedFeedback(nt) && feedbackIsError(nt)) {
+            phase = "err"; detail = "error";
+            if (item.dataset.zphase !== "err") diag("chip.errSettle", { name: VSParse.toolNameFromText(txt) });
+          }
+        }
+        // A command block that is VISIBLE right now (its hide classes live on
+        // child nodes that sites like Gemini re-create on every update, and the
+        // block may render only AFTER the chip was first placed mid-stream).
+        // Excludes the reasoning area (P.thinkingSel) like ensureOwnedChip:
+        // thinking-quoted commands otherwise keep this true forever, and the
+        // forced repaint recomputes `live` each sweep - the chip then FLAPS
+        // done→run→done with the generation flicker (seen live as a settled
+        // green chip blinking back to a blue spinner).
+        const rawVisible = [...item.querySelectorAll("pre, p, [class*='code'], .cm-line")].some(
+          (e) => !e.classList.contains("vs-tool-hide") && !e.closest(".vs-tool-hide") &&
+                 !e.closest(".vs-chip") && !(P.thinkingSel && e.closest(P.thinkingSel)) &&
+                 // see ensureOwnedChip's matching guard: a bare outer <pre>
+                 // wrapping a hidden child wrapper otherwise reads as visible
+                 // forever (Arena code-block markup).
+                 !e.querySelector(".vs-tool-hide") &&
+                 VSParse.hasCommandShape(e.textContent || ""));
+        // A tool learned to return images gets the "screen" chip even though its
+        // name alone wouldn't reveal it (parity with Roblox screen_capture). The
+        // fact can land AFTER this turn first settled (imageTools loads from
+        // storage async, or the result turn below is classified later the same
+        // pass), so repaint when the current chip's category is stale too - the
+        // phase-only guard would otherwise freeze it on the generic wrench.
+        const nm = VSParse.toolNameFromText(txt);
+        const cat = A.imageTools.has(bareToolName(nm)) ? "screen" : undefined;
+        const chipNow = item.querySelector(".vs-chip");
+        const catStale = cat === "screen" && chipNow && !chipNow.classList.contains("cat-screen");
+        // Chip drift for chipAppend providers (Kimi): the RUN chip is painted by
+        // the SWEEP (owned=false, no zloop) until the loop takes over at
+        // tool.start ~2s later, so ensureOwnedChip's drift fix (zloop-only) does
+        // NOT run during that window. Meanwhile Vue mounts the copy/regenerate
+        // toolbar (chipTrailRef) and inserts it ABOVE our chip node, flashing the
+        // action buttons over the chip until something repaints it. Detect that
+        // drift here too so the sweep re-seats the chip (chip() re-anchors before
+        // trailRef) without waiting for the loop. Mirrors ensureOwnedChip.
+        let drifted = false;
+        if (P.chipAtItemLevel && P.chipAppend && chipNow) {
+          const anchor = (P.chipAnchor && P.chipAnchor(item)) || item;
+          const trailRef = P.chipTrailRef ? P.chipTrailRef(item) : null;
+          drifted = chipNow.parentElement === anchor && chipNow.nextElementSibling !== trailRef;
+        }
+        if (item.dataset.zphase !== phase || chipGone || rawVisible || catStale || drifted) {
+          // Tracker: WHY the sweep chose this phase (only when it changes -
+          // chipGone/rawVisible repaints of the same phase stay silent).
+          if (item.dataset.zphase !== phase) {
+            // Extra suspicion flag: a command that settled ✓ done while it is
+            // still the LAST assistant with NO injected result below it - the
+            // exact shape of the "chip shows done but the model is still writing"
+            // report. genDebug() (if the provider exposes it) breaks isGenerating
+            // into its sub-signals so we can see WHICH one flickered false.
+            const suspectDone = phase === "done" &&
+              item === P.lastAssistant() && !resultAfter;
+            diag("chip.why", {
+              name: nm, to: phase,
+              stopped, live, inFlight, resumeGrace, pendingExec,
+              isLast: item === P.lastAssistant(), resultAfter,
+              gen: P.isGenerating(), run: A.running, starting: A.starting,
+              zStopped: item.dataset.zStopped === "1",
+              remembered: isRememberedHalted(item, txt),
+              lastGenAgoMs: Date.now() - A.lastGenAt,
+              suspectDone,
+              ...(P.genDebug ? { g: P.genDebug() } : {}),
+            });
+          }
+          this.toolBox(item, nm, phase, detail, false, undefined, cat);
+        }
+        return;
+      }
+
+      // A user-halted turn whose CONTENT the site cleared. Arena's native stop
+      // (which our Stop button clicks) empties the turn's .prose and shows
+      // "Generation stopped" - so the command JSON vanishes, branch 3's command
+      // shape no longer matches, and the empty-text guard just below would bail
+      // every sweep, freezing a spinning "run" chip forever. Settle any lingering
+      // run chip to "stopped" right here, BEFORE that guard. Idempotent: skips
+      // once already at the err phase.
+      const haltedTurn =
+        item.dataset.zStopped === "1" ||
+        (A.userStopped && item === P.lastAssistant());
+      if (haltedTurn && P.isAssistantItem(item) && item.dataset.zphase !== "err"
+          && item.querySelector(".vs-chip")) {
+        const tx = item.querySelector(".vs-chip-tx");
+        const name = VSParse.toolNameFromText(txt) || (tx && tx.textContent) || "tool";
+        this.toolBox(item, name, "err", "stopped", false);
+        return;
+      }
+
+      // Transient empty render (Angular swaps a turn's subtree before refilling
+      // it): the text vanishes for a frame. Never strip a decorated turn on
+      // that - the next sweep re-evaluates it with real content.
+      if (!txt.trim() && (item.dataset.zphase || item.dataset.vs)) return;
+
+      // 4. Plain text turn. If this node still wears decoration (a recycled
+      //    virtualized node), strip it so we never hide genuine content.
+      if (item.dataset.vs || item.dataset.zphase || item.querySelector(".vs-chip")) {
+        // Tracker: a decorated node re-classified as PLAIN TEXT (virtualized
+        // node recycled, or the turn's command text vanished) - its decoration
+        // (chip + zStopped marker) is stripped here. If a chip "un-settles"
+        // mysteriously, this is the smoking gun to look for.
+        diag("chip.reset", { was: item.dataset.zphase || item.dataset.vs || "chip-only" });
+        resetDecoration(item);
+      }
+    },
+
+    annotateCodeBlocks(item) {
+      // Adds Copy Luau / Run in Studio buttons to ###LUA### code blocks in a
+      // settled assistant turn (Feature: code block actions in chat replay).
+      if (!item || !P.isAssistantItem(item)) return;
+      // Only on done/errored turns (never mid-stream - the block is still live).
+      if (item.dataset.zphase !== "done" && item.dataset.zphase !== "err") return;
+      const codeBlocks = item.querySelectorAll("pre");
+      for (const block of codeBlocks) {
+        if (block.closest(S.thinking)) continue;
+        if (block.querySelector(".vs-chip")) continue;
+        const txt = block.textContent || "";
+        // Only annotate Lua blocks (###LUA###...###END_LUA###) that are still
+        // visible (not hidden by the camouflage .vs-tool-hide - those are the
+        // live-during-agent ones; hidden = already executed).
+        if (!/###\s*LUA/.test(txt) || block.classList.contains("vs-tool-hide")) continue;
+        if (block.dataset.vsAnnotated) continue;
+        block.dataset.vsAnnotated = "1";
+        // Insert a button row above the code block without disturbing the site's
+        // rendered code. The buttons let the user copy the Luau to clipboard or
+        // send it to Studio as an execute_luau command.
+        const row = document.createElement("div");
+        row.className = "vs-code-actions";
+        row.style.cssText = "display:flex;gap:6px;margin:4px 0;";
+        const copyBtn = document.createElement("button");
+        copyBtn.textContent = "Copy Luau";
+        copyBtn.className = "vs-code-btn vs-code-copy";
+        copyBtn.style.cssText = "font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#fff;cursor:pointer;";
+        const runBtn = document.createElement("button");
+        runBtn.textContent = "Run in Studio";
+        runBtn.className = "vs-code-btn vs-code-run";
+        runBtn.style.cssText = copyBtn.style.cssText;
+        row.appendChild(copyBtn);
+        row.appendChild(runBtn);
+        (block.parentElement || block).insertBefore(row, block);
+        copyBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const lua = VSParse.extractLua(txt);
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(lua);
+            } else {
+              const ta = document.createElement("textarea"); ta.value = lua; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+            }
+            ui.toast("Lua copied ✓");
+          } catch { ui.toast("Copy failed"); }
+        });
+        runBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const lua = VSParse.extractLua(txt);
+          if (!lua.trim()) { ui.toast("No Lua code in this block"); return; }
+          // Inject an execute_luau command block into the chat composer.
+          try {
+            const ed = P.getEditor && P.getEditor();
+            if (!ed) { ui.toast("No input box found"); return; }
+            if (P.setEditorValue) P.setEditorValue(ed, "###LUA###\n" + lua + "\n###END_LUA###");
+            else ed.textContent = "###LUA###\n" + lua + "\n###END_LUA###";
+            ui.toast("Lua inserted · press Send");
+          } catch (err) { ui.toast("Run failed: " + (err && err.message)); }
+        });
+      }
+    },
+    sweep() {
+      // Pass each turn's FOLLOWING turn too: a command chip needs it to know
+      // whether its injected result was an ERROR (error-aware settle above).
+      // Re-reading every turn's text is what makes long chats sluggish, and old
+      // turns rarely change. Do the newest few each time and everything every 2s
+      // (that full pass also restores chips a re-render wiped further up).
+      const items = P.allItems();
+      const now = Date.now();
+      const full = now - (this.fullAt || 0) > 2000;
+      if (full) this.fullAt = now;
+      for (let i = full ? 0 : Math.max(0, items.length - 4); i < items.length; i++) {
+        this.classify(items[i], items[i + 1] || null);
+        // Annotate ###LUA### code blocks with Copy / Run buttons (chat replay).
+        this.annotateCodeBlocks(items[i]);
+      }
+      // Safety net for stopped turns whose chip lives OUTSIDE the enumerated
+      // message list. On Arena an A/B comparison renders each candidate as a
+      // slide in the carousel's OWN nested <ol>, not the main flex-col-reverse
+      // list - so allItems()/classify never see that node and a "run" spinner
+      // left by a Stop would spin forever. zStopped is only ever set on a
+      // deliberate halt, so settling any run-phase chip under such a node is
+      // safe wherever it lives. Idempotent: skips once at the err phase.
+      for (const chip of document.querySelectorAll(".vs-chip.run")) {
+        let item = chip.parentElement;
+        while (item && !(item.dataset && item.dataset.zStopped)) item = item.parentElement;
+        if (item && item.dataset.zphase !== "err") {
+          const tx = chip.querySelector(".vs-chip-tx");
+          this.toolBox(item, (tx && tx.textContent) || "tool", "err", "stopped", false);
+        }
+      }
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  UI  (control panel, onboarding, stop button, banners, toast, input cover)
+  //  Shared with the top-level 200ms tick (outside the `ui` IIFE) which drives the
+  //  live timer — declared here so both closures see the same node.
+  // ════════════════════════════════════════════════════════════════════════
+  let liveEl = null; // the bar's live session timer (#vs-live), updated by the 200ms UI tick
+  const ui = (() => {
+       let root, bar, dot, brandEl, stateEl, actionBtn, stopBtn, switchBtn, supportBtn, discordEl, menuEl, unstableEl;
+    let cover, coverRaf, barRaf;
+    let voiceBtn = null;
+    let quickShotBtn = null, quickListBtn = null;
+    let openMenuFn = null; // set by build(); lets the popup force the panel open via runtime message
+    let pauseBtn = null;    // the bar's "⏸ Pause / ▶ Resume" toggle (#vs-pause)
+    let coworkBtn = null, undoBtn = null, steerRow = null, steerInput = null; // Co-work steering UI
+    let bridgeOk = false, studioDown = false, placeDown = false, appDown = false, addonOk = false, studioProcUp = false;
+    let wasConnected = false, bridgeBannerEl = null;
+    let vsUpdateTag = "";
+
+    function build() {
+      root = document.createElement("div");
+      root.id = "vs-root";
+      // One consolidated status bar, anchored just above the site's composer
+      // (positioned every frame by placeBar). It carries everything: live status,
+      // the primary action (Start / Stop) and a "more"
+      // menu (other AI sites, custom prompt, support, Discord). No floating panel,
+      // no overlay on the input - the composer stays fully usable for plain chat.
+      root.innerHTML = `
+        <div id="vs-bar">
+          <svg id="vs-mark" width="20" height="20" viewBox="0 0 128 128" aria-hidden="true" style="flex:0 0 auto;filter:drop-shadow(0 0 4px rgba(255,138,61,.55))"><defs><linearGradient id="vsmr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffd9c0"/><stop offset=".5" stop-color="#ff8a3d"/><stop offset="1" stop-color="#ff5c8a"/></linearGradient><radialGradient id="vsmv" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#0b0d13"/><stop offset=".7" stop-color="#131420"/><stop offset="1" stop-color="#241a28"/></radialGradient></defs><circle cx="64" cy="64" r="54" fill="url(#vsmv)"/><circle cx="64" cy="64" r="54" fill="none" stroke="url(#vsmr)" stroke-width="9"/><g stroke="url(#vsmr)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" fill="none"><polyline points="49,44 30,64 49,84"/><polyline points="79,44 98,64 79,84"/><line x1="71" y1="40" x2="57" y2="88"/></g></svg>
+          <span id="vs-dot" class="off" title=""></span>
+          <span id="vs-brand">VoidScript <span class="vs-free">v${EXT_VERSION}</span></span>
+          <span id="vs-state"></span>
+           <span id="vs-live"></span>
+           <button id="vs-quick-shot" hidden aria-label="Screenshot Studio" title="Take a screenshot of Studio and inspect it"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 3 7.17 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.17L15 3H9zm3 14a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg></button>
+           <button id="vs-quick-list" hidden aria-label="List assets" title="List all objects/scripts in the game"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="20" y2="18"/><circle cx="3.6" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="3.6" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="3.6" cy="18" r="1.3" fill="currentColor" stroke="none"/></svg></button>
+           <button id="vs-action"></button>
+          <button id="vs-stop" hidden>■ Stop</button>
+          <button id="vs-pause" hidden>⏸ Pause</button>
+          <button id="vs-cowork" hidden aria-pressed="false" title="Guide: steer the agent while it runs — type a correction and it adjusts its next step"><span class="vs-cw-dot"></span><span class="vs-cw-label">Guide</span></button>
+          <div id="vs-steer" hidden>
+            <div class="vs-steer-main">
+              <button id="vs-undo" hidden title="Undo the agent's last script edit (restores the previous source)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-1"/></svg><span class="vs-undo-label">Undo</span></button>
+              <input id="vs-steer-input" type="text" autocomplete="off" spellcheck="false" placeholder="Steer the next step…" aria-label="Steer the agent's next step" />
+              <button id="vs-steer-send" title="Send this steer to the agent's next step">Steer</button>
+            </div>
+            <div class="vs-steer-presets">
+              <button class="vs-steer-chip" data-steer="Stop — what you just did is wrong. Fix it before continuing.">Fix that</button>
+              <button class="vs-steer-chip" data-steer="Undo your last change and take a different approach.">Undo &amp; retry</button>
+              <button class="vs-steer-chip" data-steer="That looks right — keep going with the plan.">Keep going</button>
+              <button class="vs-steer-chip" data-steer="Pause and explain your plan before making more changes.">Explain first</button>
+            </div>
+          </div>
+          <a id="vs-discord" href="https://discord.gg/KmkCKwUbcX" target="_blank" rel="noopener" title="Need help? Join our Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
+           <button id="vs-voice" hidden aria-label="Speak to VoidScript" title="Speak to VoidScript (transcribes and inserts)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 0 0 2 0v-3.08A7 7 0 0 0 19 11z"/></svg></button>
+          <button id="vs-switch" aria-label="Switch AI and options" title="Switch AI, custom prompt, support"><span id="vs-switch-name"></span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>
+          <button id="vs-support" aria-label="Support VoidScript" title="Support VoidScript"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button>
+        </div>
+        <div id="vs-menu" hidden></div>
+        ${P.unstableWarning ? `<button id="vs-unstable" aria-label="Provider may be unstable" hidden>⚠ unstable</button>` : ""}
+      `;
+      // Attached by placeBar's self-heal once the page has settled (see whenSettled).
+      bar = root.querySelector("#vs-bar");
+       dot = root.querySelector("#vs-dot");
+      brandEl = root.querySelector("#vs-brand");
+      stateEl = root.querySelector("#vs-state");
+      liveEl = root.querySelector("#vs-live");
+      actionBtn = root.querySelector("#vs-action");
+      stopBtn = root.querySelector("#vs-stop");
+      pauseBtn = root.querySelector("#vs-pause");
+      coworkBtn = root.querySelector("#vs-cowork");
+      undoBtn = root.querySelector("#vs-undo");
+      steerRow = root.querySelector("#vs-steer");
+      steerInput = root.querySelector("#vs-steer-input");
+      switchBtn = root.querySelector("#vs-switch");
+      supportBtn = root.querySelector("#vs-support");
+      discordEl = root.querySelector("#vs-discord");
+      voiceBtn = root.querySelector("#vs-voice");
+      quickShotBtn = root.querySelector("#vs-quick-shot");
+      quickListBtn = root.querySelector("#vs-quick-list");
+      const swName = root.querySelector("#vs-switch-name");
+      if (swName) swName.textContent = P.displayName || P.id;
+      menuEl = root.querySelector("#vs-menu");
+      bar.classList.add(`vs-prov-${P.id}`); // lets CSS tune per-site (e.g. font)
+      // Provider hook on <html> so overlay.css can tune site-specific CHIP layout
+      // (not just the bar). Meta's turn root is full-width with the reply in a
+      // nested centered column, so whole-turn chips (result/sys) need re-centering.
+      whenSettled.then(() => { document.documentElement.classList.add(`vs-site-${P.id}`); applyTheme(); });
+
+      actionBtn.addEventListener("click", onActionClick);
+      stopBtn.addEventListener("click", stopLoop);
+      if (pauseBtn) {
+        pauseBtn.addEventListener("click", () => {
+          A.paused = !A.paused;
+          // Resuming from a budget pause grants the next batch of commands.
+          if (!A.paused && A.budgetPaused) {
+            A.budgetPaused = false;
+            A.cmdBudgetHits = 0;
+            diag("budget.grant", {});
+          }
+          updatePauseBtn();
+          renderBar();
+          ui.toast(A.paused ? "Agent paused." : "Agent resumed.");
+        });
+      }
+      // Co-work (Feature): human-in-the-loop steering. Toggle turns on a steer box;
+      // typed corrections are queued and injected into the agent's NEXT turn (see
+      // submitAndGetBase) so the user can redirect the model or fix a wrong action
+      // without stopping the session.
+      if (coworkBtn) {
+        coworkBtn.addEventListener("click", () => {
+          VS_CFG.vsCowork = !VS_CFG.vsCowork;
+          try { chrome.storage.local.set({ vsCowork: VS_CFG.vsCowork }); } catch {}
+          if (!VS_CFG.vsCowork) A.steerQueue = []; // dropping the mode clears pending steers
+          updateCowork();
+          renderBar();
+          ui.toast(VS_CFG.vsCowork ? tr("b_guideOn") : tr("b_guideOff"));
+          if (VS_CFG.vsCowork && steerInput) { try { steerInput.focus(); } catch {} }
+        });
+      }
+      // Queue a steer (from the input or a preset chip) for the agent's next turn.
+      const queueSteer = (text) => {
+        const v = String(text || "").trim();
+        if (!v) return;
+        A.steerQueue = A.steerQueue || [];
+        A.steerQueue.push(v);
+        diag("cowork.steerQueued", { len: v.length, pending: A.steerQueue.length });
+        ui.toast(A.running ? tr("b_queuedRun") : tr("b_queuedIdle"));
+        updateCowork();
+      };
+      const submitSteer = () => {
+        if (!steerInput) return;
+        const v = steerInput.value.trim();
+        if (!v) { try { steerInput.focus(); } catch {} return; }
+        steerInput.value = "";
+        queueSteer(v);
+      };
+      const steerSendBtn = root.querySelector("#vs-steer-send");
+      if (steerSendBtn) steerSendBtn.addEventListener("click", submitSteer);
+      // One-click steer presets: common corrections without typing.
+      root.querySelectorAll(".vs-steer-chip").forEach((chip) => {
+        chip.addEventListener("click", () => queueSteer(chip.getAttribute("data-steer")));
+      });
+      // Undo (Co-work): revert the agent's most recent script edit immediately, on
+      // the user's command — independent of the AI turn (it just talks to Studio via
+      // the same revert path revert_last uses).
+      if (undoBtn) {
+        undoBtn.addEventListener("click", async () => {
+          if (undoBtn.disabled) return;
+          if (A.toolRunning) { ui.toast("A command is running — try Undo again in a moment."); return; }
+          if (!_undoStack.length) { ui.toast("Nothing to undo yet."); return; }
+          const entry = _undoStack[_undoStack.length - 1];
+          undoBtn.disabled = true;
+          const label = undoBtn.querySelector(".vs-undo-label");
+          const prev = label ? label.textContent : "";
+          if (label) label.textContent = "Undoing…";
+          try {
+            const r = await revertEntry(entry);
+            if (r === "OK") {
+              _undoStack.pop();
+              persistUndoStack();
+              timeline("event", { name: "undo" });
+              ui.toast(`Undid last edit to ${entry.path.split(/[\\/.]/).pop() || entry.path}.`);
+            } else {
+              ui.toast(r.replace(/^ERROR:?\s*/, "Undo failed: ").slice(0, 120));
+            }
+          } catch (e) {
+            ui.toast("Undo failed: " + String((e && e.message) || e).slice(0, 100));
+          } finally {
+            undoBtn.disabled = false;
+            if (label) label.textContent = prev || "Undo";
+            updateCowork();
+          }
+        });
+      }
+      if (steerInput) {
+        steerInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); submitSteer(); }
+          e.stopPropagation(); // don't let the host page hijack typing
+        });
+      }
+      unstableEl = root.querySelector("#vs-unstable");
+      if (unstableEl) {
+        // Set the native tooltip via PROPERTY, not the HTML template: the warning
+        // text may contain double quotes (e.g. GLM's "No response…"), which would
+        // terminate a title="..." attribute early and truncate the tooltip.
+        unstableEl.title = P.unstableWarning;
+        unstableEl.addEventListener("click", (e) => { e.stopPropagation(); toast(P.unstableWarning); });
+      }
+      buildMenu();
+      // Voice transcription (Feature): speak into the mic and the transcript is
+      // inserted into the site's composer. Uses the Web Speech API (no
+      // external server); falls back to a toast if unavailable. The button only
+      // shows when the API is present; hidden otherwise via the HTML `hidden`
+      // attribute we set at build time.
+      if (voiceBtn) {
+        voiceBtn.hidden = !P.voiceAvailable;
+        if (P.voiceAvailable) {
+          voiceBtn.addEventListener("click", onVoiceClick);
+        }
+      }
+       // Quick action buttons (Feature): one-click shortcuts that inject a command
+       // into the composer + send. Only shown when a session is active.
+      if (quickShotBtn) {
+        quickShotBtn.addEventListener("click", () => {
+          const ed = P.getEditor && P.getEditor();
+          if (!ed) { ui.toast("No input box found"); return; }
+          const cmd = '{"command": "screen_capture"}';
+          if (P.setEditorValue) P.setEditorValue(ed, cmd);
+          else ed.textContent = cmd;
+          ui.toast("Screenshot command inserted · press Send");
+        });
+      }
+      if (quickListBtn) {
+        quickListBtn.addEventListener("click", () => {
+          const ed = P.getEditor && P.getEditor();
+          if (!ed) { ui.toast("No input box found"); return; }
+          const cmd = '{"command": "list_commands"}';
+          if (P.setEditorValue) P.setEditorValue(ed, cmd);
+          else ed.textContent = cmd;
+          ui.toast("List-commands inserted · press Send");
+        });
+      }
+      // Voice transcription: records speech via the Web Speech API and inserts the
+      // final transcript into the current turn's editor. While recording the mic
+      // button gets a "recording" dot so the user knows it's live.
+      let _recognition = null, _voiceTimer = null;
+      function onVoiceClick(e) {
+        e.stopPropagation();
+        const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!Rec) { toast("Speech recognition is not available in this browser."); return; }
+        if (_recognition) {
+          try { _recognition.abort(); } catch {}
+          _recognition = null;
+          if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
+          voiceBtn.classList.remove("vs-voice-rec");
+          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          return;
+        }
+        try {
+          _recognition = new Rec();
+        } catch (err) {
+          toast("Speech recognition failed to start. " + (err && err.message));
+          _recognition = null;
+          return;
+        }
+        _recognition.continuous = false;
+        _recognition.interimResults = false;
+        _recognition.lang = (VS_CFG.vsVoiceLang || "en-US");
+        voiceBtn.classList.add("vs-voice-rec");
+        voiceBtn.title = "Stop recording";
+        _voiceTimer = setTimeout(() => {
+          voiceBtn.classList.remove("vs-voice-rec");
+          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+        }, 15000);
+        _recognition.onresult = (ev) => {
+          const t = (ev.results[ev.resultIndex] && ev.results[ev.resultIndex][0] && ev.results[ev.resultIndex][0].transcript) || "";
+          if (!t) return;
+          const ed = P.getEditor && P.getEditor();
+          if (ed) {
+            P.setEditorValue ? P.setEditorValue(ed, (P.editorText ? P.editorText() : "") + " " + t.trim()) : (ed.textContent = (ed.textContent || "") + " " + t.trim());
+            ui.toast(`Heard: "${t.trim().slice(0, 60)}${t.trim().length > 60 ? "…" : ""}"`);
+          } else {
+            ui.toast("No input box found to insert the transcript into.");
+          }
+        };
+        _recognition.onerror = (ev) => {
+          if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
+          voiceBtn.classList.remove("vs-voice-rec");
+          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          _recognition = null;
+          const msg = (ev && ev.error) || "unknown";
+          if (msg === "not-allowed" || msg === "permission-denied") {
+            toast("Microphone access was denied. Allow mic for this site in your browser settings.");
+          } else {
+            toast("Voice recognition error: " + msg);
+          }
+        };
+        _recognition.onend = () => {
+          if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
+          voiceBtn.classList.remove("vs-voice-rec");
+          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          _recognition = null;
+        };
+        try { _recognition.start(); } catch (err) {
+          toast("Voice recognition start failed. " + (err && err.message));
+          _recognition = null;
+        }
+      }
+       // Theme application (Feature): toggles a data attribute on <html> that
+      // overlay.css keys off, so the VoidScript UI (bar, chips, menu) follows the
+      // picked theme. "system" defers to prefers-color-scheme.
+      function applyVsTheme(theme) {
+        const root = document.documentElement;
+        if (theme === "system") {
+          root.removeAttribute("data-vs-theme");
+        } else {
+          root.setAttribute("data-vs-theme", theme);
+        }
+      }
+      // If a theme was persisted, apply it immediately on script load (before the
+      // menu's own handler runs) so the bar renders in the right theme from frame 1.
+      // Waits for the page to settle like every other write to <html> (see whenSettled).
+      whenSettled.then(() => { try { if (VS_CFG.vsTheme) applyVsTheme(VS_CFG.vsTheme); } catch {} });
+      // Both bar controls open the same panel; the heart lands on the Support
+      // section (last), the model button opens at the top with Switch AI.
+      const toggleMenu = (toSupport) => {
+        menuEl.hidden = !menuEl.hidden;
+        if (!menuEl.hidden) {
+          // Rebuild on every open, not just once at page load: the initial
+          // buildMenu() call runs before the bridge status (server list/health)
+          // has arrived, so the very first render always shows an empty/stale
+          // MCP servers section otherwise - nothing ever refreshed it after.
+          buildMenu();
+          syncMenuPrompt();
+          // On a FRESH open, menuEl has no max-height yet - that's only applied by
+          // placeBar()'s positioning pass, which runs on the next rAF tick (it's a
+          // separate loop, not synchronous with this click). Without it the panel
+          // has no overflow yet, so scrollHeight === clientHeight and setting
+          // scrollTop here is a no-op - the "jump to Support" silently failed on
+          // the very first open (reported live on Arena). Deferring one frame lets
+          // placeBar's already-queued tick clip the box first, so there's real
+          // scroll room by the time we set scrollTop.
+          requestAnimationFrame(() => {
+            if (!menuEl.hidden) menuEl.scrollTop = toSupport ? menuEl.scrollHeight : 0;
+          });
+        }
+      };
+      switchBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(false); });
+      supportBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(true); });
+      // Keyboard shortcuts (Feature): Alt+V menu, Alt+S start/stop, Alt+P
+      // pause/resume, Alt+X stop, Alt+Z background-mode toggle, Esc stop while
+      // running. Ignored while typing into inputs/editors.
+      document.addEventListener("keydown", (e) => {
+        const inField = () => {
+          const tag = document.activeElement && document.activeElement.tagName;
+          return tag === "TEXTAREA" || tag === "INPUT" || tag === "SELECT" ||
+            (document.activeElement && document.activeElement.isContentEditable);
+        };
+        if (e.altKey && !e.ctrlKey && !e.metaKey) {
+          const k = e.key.toLowerCase();
+          if (k === "v") { if (inField()) return; e.preventDefault(); toggleMenu(false); return; }
+          if (k === "s") {
+            if (inField()) return; e.preventDefault();
+            const kind = actionBtn && actionBtn.dataset.kind;
+            if (A.running || A.starting) { stopLoop(); }
+            else if (kind === "start" || kind === "start-degraded") { startSession(); }
+            return;
+          }
+          if (k === "p") {
+            if (!A.running) return; e.preventDefault();
+            A.paused = !A.paused;
+            if (!A.paused && A.budgetPaused) { A.budgetPaused = false; A.cmdBudgetHits = 0; diag("budget.grant", {}); }
+            updatePauseBtn(); renderBar();
+            ui.toast(A.paused ? "Agent paused." : "Agent resumed.");
+            return;
+          }
+          if (k === "x") { if (!A.running) return; e.preventDefault(); stopLoop(); return; }
+          if (k === "z") {
+            if (inField()) return; e.preventDefault();
+            VS_CFG.vsBackground = !VS_CFG.vsBackground;
+            try { chrome.storage.local.set({ vsBackground: VS_CFG.vsBackground }); } catch {}
+            ui.toast(VS_CFG.vsBackground ? "Background mode on." : "Background mode off.");
+            diag("cfg.toggle", { key: "vsBackground", on: VS_CFG.vsBackground });
+            return;
+          }
+          return;
+        }
+        if (e.key === "Escape" && A.running && !inField()) {
+          e.preventDefault();
+          stopLoop();
+        }
+      });
+      openMenuFn = (toSupport) => { if (menuEl.hidden) toggleMenu(toSupport); };
+      document.addEventListener("click", (e) => {
+        if (menuEl.hidden) return;
+        if (!menuEl.contains(e.target) && !switchBtn.contains(e.target) && !supportBtn.contains(e.target))
+          menuEl.hidden = true;
+      }, true);
+
+      applyTheme();
+      setInterval(applyTheme, 2000); // follow the host page toggling its theme
+      renderBar();
+      placeBar(); // start the per-frame anchoring loop
+    }
+
+    // The primary button does different things depending on the current state
+    // (set by renderBar via actionBtn.dataset.kind).
+    function onActionClick() {
+      const kind = actionBtn.dataset.kind;
+      if (kind === "start" || kind === "start-degraded") startSession();
+      else if (kind === "starting") stopLoop();
+    }
+
+    // ── Custom prompt (persisted) ───────────────────────────────────────────
+    // The user's extra instructions, persisted in chrome.storage.local and
+    // appended UNDER the system prompt at session start. Cached here so
+    // startSession can read it synchronously.
+    let customPrompt = "";
+    try {
+      chrome.storage.local.get("vsCustomPrompt", (r) => {
+        if (r && typeof r.vsCustomPrompt === "string") {
+          customPrompt = r.vsCustomPrompt;
+          syncMenuPrompt();
+        }
+      });
+    } catch {}
+    // Per-place custom prompts (Feature: vsPromptPerPlace): a separate prompt per
+    // open place, so different projects get project-specific instructions without
+    // overwriting the global one. Map stored in chrome.storage.local under
+    // "vsCustomPromptByPlace", keyed by the place name from the bridge.
+    const customPromptByPlace = {};
+    try {
+      chrome.storage.local.get("vsCustomPromptByPlace", (r) => {
+        if (r && typeof r.vsCustomPromptByPlace === "object" && r.vsCustomPromptByPlace) {
+          Object.assign(customPromptByPlace, r.vsCustomPromptByPlace);
+        }
+      });
+    } catch {}
+    // The place the bridge currently reports (set by setStatus). Empty until the
+    // bridge connects; the prompt falls back to the global one while unknown.
+    let activePlaceName = "";
+    function currentPlace() {
+      return vsOn("vsPromptPerPlace") ? (activePlaceName || "") : "";
+    }
+    function getCustomPrompt() {
+      const place = currentPlace();
+      if (place && customPromptByPlace[place]) return customPromptByPlace[place];
+      return customPrompt;
+    }
+    function setCustomPrompt(v) {
+      const place = currentPlace();
+      if (place) {
+        customPromptByPlace[place] = String(v || "");
+        try { chrome.storage.local.set({ vsCustomPromptByPlace: customPromptByPlace }); } catch {}
+      } else {
+        customPrompt = String(v || "");
+        try { chrome.storage.local.set({ vsCustomPrompt: customPrompt }); } catch {}
+      }
+      syncMenuPrompt();
+    }
+    // Reflect the saved value back into the menu textarea (unless being edited),
+    // and label which prompt is currently in effect.
+    function syncMenuPrompt() {
+      const ta = root && root.querySelector("#vs-set-text");
+      if (ta && document.activeElement !== ta) ta.value = getCustomPrompt();
+      const note = root && root.querySelector("#vs-set-note");
+      if (note) {
+        const place = currentPlace();
+        note.textContent = place
+          ? `Editing the prompt for place "${place}". Uncheck "Per-place prompt" in Settings to edit the global prompt.`
+          : "";
+      }
+    }
+
+    // ── Project type (Feature: auto prompt-engineering) ──────────────────────
+    // A genre picked once in the menu, injected into the system prompt on every
+    // new session (config.js PROJECT_TYPES holds the per-genre guidance).
+    let projectType = "";
+    try {
+      chrome.storage.local.get("vsProjectType", (r) => {
+        if (r && typeof r.vsProjectType === "string") {
+          projectType = r.vsProjectType;
+          const sel = root && root.querySelector("#vs-project-type");
+          if (sel && sel.value !== projectType) sel.value = projectType;
+        }
+      });
+    } catch {}
+    function getProjectType() { return projectType; }
+    function setProjectType(v) {
+      projectType = VS.PROJECT_TYPES[v] ? v : "";
+      try { chrome.storage.local.set({ vsProjectType: projectType }); } catch {}
+    }
+    // ── One-click build wizard (Feature: guided starter build) ───────────────
+    // The wizard writes a composed first-build prompt here; startSession consumes
+    // it right after the bootstrap and auto-sends it as the first user message,
+    // so one click goes from menu → session → first build.
+    let wizardPrompt = "";
+    try {
+      chrome.storage.local.get("vsWizardPrompt", (r) => {
+        if (r && typeof r.vsWizardPrompt === "string" && r.vsWizardPrompt) wizardPrompt = r.vsWizardPrompt;
+      });
+    } catch {}
+    function setWizardPrompt(v) {
+      wizardPrompt = v;
+      try {
+        if (v) chrome.storage.local.set({ vsWizardPrompt: v });
+        else chrome.storage.local.remove("vsWizardPrompt");
+      } catch {}
+    }
+    function takeWizardPrompt() {
+      const v = wizardPrompt;
+      if (v) setWizardPrompt("");
+      return v;
+    }
+
+    // ── Compaction handoff (context-limit continuation) ────────────────────
+    // takeCompactionHandoff() returns (and clears) the saved build state from a
+    // previous chat that hit its context limit, if it is fresh enough to reuse.
+    function takeCompactionHandoff() {
+      const h = _compactHandoff;
+      if (!h || !h.summary) return null;
+      if (Date.now() - (h.t || 0) > 24 * 3600 * 1000) return null;
+      _compactHandoff = null;
+      try { chrome.storage.local.remove("vsCompactionHandoff"); } catch {}
+      const projectLine = h.projectType ? ` (project type: ${h.projectType})` : "";
+      return `(System note: this is a CONTINUATION of an earlier build that hit the previous chat's context limit. Read the saved build state below${projectLine}, consult the project memory, and CONTINUE the build exactly where it left off - re-run the last command if it never completed.)\n\n--- SAVED BUILD STATE ---\n${h.summary}\n--- END SAVED BUILD STATE ---`;
+    }
+
+    // ── Custom MCP servers (addons) ─────────────────────────────────────────
+    // User-added MCP servers shown at the very bottom of the menu. These are
+    // ADDONS: the Roblox server stays primary and is never in this list. Each
+    // entry is { id, name, command } - `command` is the raw string the user
+    // typed (split into command+args when sent to the bridge). The bridge writes
+    // them to config.json and restarts to load them; this local list only drives
+    // the menu UI and is kept in sync with the bridge's server health.
+    let customMcpServers = [];
+    try {
+      chrome.storage.local.get("vsCustomMcpServers", (r) => {
+        if (r && Array.isArray(r.vsCustomMcpServers)) {
+          customMcpServers = r.vsCustomMcpServers;
+          if (!menuEl.hidden) buildMenu();
+        }
+      });
+    } catch {}
+    function getCustomMcpServers() { return customMcpServers; }
+    function saveCustomMcpServers() {
+      try { chrome.storage.local.set({ vsCustomMcpServers: customMcpServers }); } catch {}
+    }
+    // The bridge (config.json + live health) is the SOURCE OF TRUTH for which
+    // addon servers actually exist - chrome.storage.local is just a display-name
+    // cache, and the two CAN drift (e.g. storage cleared, or config.json edited
+    // by hand). Rendering from the bridge's live list means an addon never
+    // "disappears" from the menu while still running - and self-heals the local
+    // cache the moment we see a server it didn't know about.
+    function mergedMcpServers() {
+      const live = ((A.bridge && A.bridge.servers) || []).filter((sv) => sv.id !== "roblox");
+      const byId = new Map(customMcpServers.map((s) => [s.id, s]));
+      const merged = live.map((sv) => {
+        const cached = byId.get(sv.id);
+        return {
+          id: sv.id, name: (cached && cached.name) || sv.id, command: cached && cached.command,
+          alive: sv.alive, tools: sv.tools,
+        };
+      });
+      // Self-heal: cache didn't know about a server the bridge actually has.
+      let healed = false;
+      for (const sv of live) {
+        if (!byId.has(sv.id)) { customMcpServers.push({ id: sv.id, name: sv.id }); healed = true; }
+      }
+      if (healed) saveCustomMcpServers();
+      // A server we just added/removed but the bridge hasn't reported back on
+      // yet (mid-restart) - still show it, health unknown, so it doesn't blink
+      // out of the list during the few seconds the bridge is restarting.
+      for (const s of customMcpServers) {
+        if (!merged.some((m) => m.id === s.id)) merged.push({ ...s, alive: undefined, tools: undefined });
+      }
+      return merged;
+    }
+    // Derive a config-safe server id from a display name (roblox is reserved).
+    function mcpSlug(name) {
+      let s = String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      if (!s || s === "roblox") s = `addon-${s || "server"}`;
+      let id = s, n = 2;
+      while (customMcpServers.some((x) => x.id === id)) id = `${s}-${n++}`;
+      return id;
+    }
+    // Split a raw "command with args" string into command + args (shell-lite:
+    // whitespace-separated, honouring "double" and 'single' quotes).
+    function splitCommand(raw) {
+      const parts = String(raw || "").match(/"[^"]*"|'[^']*'|\S+/g) || [];
+      const clean = parts.map((p) => p.replace(/^["']|["']$/g, ""));
+      return { command: clean[0] || "", args: clean.slice(1) };
+    }
+    // Wait for the bridge to come back after its restart (config reload). Resolves
+    // true once reconnected (optionally once `id` shows up in server health).
+    async function waitForBridgeBack(id, timeoutMs = 15000) {
+      const t0 = Date.now();
+      // Give the bridge a moment to actually drop before we start polling, so we
+      // don't instantly match the pre-restart "connected" state.
+      await new Promise((r) => setTimeout(r, 1200));
+      while (Date.now() - t0 < timeoutMs) {
+        const s = await bg({ type: "status" });
+        if (s && s.connected) {
+          if (!id || (Array.isArray(s.servers) && s.servers.some((x) => x.id === id))) return true;
+        }
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      return false;
+    }
+
+    // ── The "more" menu (⋯) ─────────────────────────────────────────────────
+    // One popover holding every secondary control: other AI sites, the custom
+    // prompt, and support (Star on GitHub / watch an ad). Opens above the bar.
+    // Recommended picks get a badge next to their name in the Switch AI list.
+    const SITE_LABELS = {
+      "Claude": "best",
+      "DeepSeek": "recommended",
+      "GLM": "recommended",
+      "Qwen": "recommended",
+    };
+    function buildMenu() {
+      const here = (P.displayName || "").toLowerCase();
+      const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
+      const badgeOf = (name) => SITE_LABELS[name]
+        ? `<span class="vs-site-badge vs-site-badge-${SITE_LABELS[name]}">${SITE_LABELS[name]}</span>`
+        : "";
+      let sites = "";
+      for (const s of AI_SITES) {
+        const current = s.name.toLowerCase() === here;
+        const badge = badgeOf(s.name);
+        const label = `<span class="vs-site-name"><span>${s.name}</span><span class="vs-site-host">${hostOf(s.url)}</span></span>`;
+        sites += current
+          ? `<div class="vs-site-opt vs-site-here">${label}${badge}<span class="vs-site-badge">active</span></div>`
+          : `<button class="vs-site-opt" data-u="${s.url}">${label}${badge}<span class="vs-site-go">&rarr;</span></button>`;
+      }
+      const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      const mergedServers = mergedMcpServers();
+      // Roblox always heads the list - greyed out, no health dot (its own status
+      // is already the main VoidScript dot elsewhere) and no remove button (it's
+      // the primary server, protected bridge-side too).
+      let mcpList =
+        `<div class="vs-mcp-item vs-mcp-item-primary"><div class="vs-mcp-info"><span class="vs-mcp-name">Roblox Studio</span><span class="vs-mcp-url">primary - always connected</span></div></div>`;
+      mergedServers.forEach((s, i) => {
+        // alive === undefined -> the bridge hasn't reported this server's health
+        // yet (just added/removed, still restarting) - shown neutral, not red.
+        const healthClass = s.alive === true ? "on" : s.alive === false ? "off" : "unknown";
+        const healthTitle = s.alive === true ? `${s.tools || 0} tools available` : s.alive === false ? "offline" : "status unknown";
+        mcpList += `<div class="vs-mcp-item"><span class="vs-mcp-health vs-mcp-health-${healthClass}" title="${healthTitle}"></span><div class="vs-mcp-info"><span class="vs-mcp-name">${esc(s.name)}</span><span class="vs-mcp-url">${esc(s.command || s.id)}</span></div><button class="vs-mcp-remove" data-id="${esc(s.id)}" title="Remove">✕</button></div>`;
+      });
+      // Provider stability notes (Feature): curated per-provider observations.
+      const stabilityEntries = VS.PROVIDER_STABILITY || {};
+      const stabilityHtml = Object.keys(stabilityEntries).length
+        ? `<section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Provider stability</span></div>
+            <div class="vs-menu-note">Field notes on how reliably each site works with VoidScript (they change their UI often, so treat these as "tends to").</div>
+            ${Object.keys(stabilityEntries).map((k) => {
+              const s = stabilityEntries[k];
+              return `<div class="vs-prov-stab"><span class="vs-stab-lvl vs-stab-${esc(s.level)}">${esc(s.level)}</span><span class="vs-stab-name">${esc(k)}</span><span class="vs-stab-note">${esc(s.note)}</span></div>`;
+            }).join("")}
+          </section>`
+        : "";
+      menuEl.innerHTML =
+        `<div class="vs-menu-head"><span class="vs-menu-logo">VoidScript</span><span class="vs-menu-tag">v${EXT_VERSION}</span></div>
+         ${vsUpdateTag ? `<section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Update</span></div>
+           <button class="vs-tip-opt vs-tip-update" data-u="https://github.com/cjl26rg2/Void-Script/releases"><span>Update available · v${esc(vsUpdateTag.replace(/^[vV]/, ""))}</span><span class="vs-tip-sub">get the latest build</span></button>
+         </section>` : ""}
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Create</span></div>
+           <button class="vs-tip-opt" id="vs-open-models"><span>Model generator</span><span class="vs-tip-sub">describe it, see it in 3D, drop it into Studio</span></button>
+           <button class="vs-tip-opt" id="vs-open-ui"><span>UI builder</span><span class="vs-tip-sub">shops, menus, HUDs - previewed, then inserted</span></button>
+           <button class="vs-tip-opt" id="vs-open-kit"><span>Toolkit</span><span class="vs-tip-sub">game templates, script fixes, health check</span></button>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Switch AI</span></div>
+           ${sites}
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Free Support</span></div>
+           <button class="vs-tip-opt vs-tip-star" data-u="${GITHUB_URL}"><span>Star on GitHub</span><span class="vs-tip-sub">free, helps a lot</span></button>
+           ${WORKINK_URL ? `<button class="vs-tip-opt vs-tip-ad" data-u="${WORKINK_URL}"><span>Watch an ad to support</span><span class="vs-tip-sub">free, takes a minute</span></button>` : ""}
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Custom prompt</span></div>
+           <div class="vs-menu-note">Added below the system prompt on every new session. The built-in prompt can't be edited. With "Per-place prompt" enabled (Settings), this textarea edits the prompt for the place currently open in Roblox Studio.</div>
+           <textarea id="vs-set-text" rows="4" placeholder="e.g. Always comment your Luau code. Prefer small modular scripts."></textarea>
+           <div id="vs-set-note" class="vs-menu-note"></div>
+           <div class="vs-set-row"><button id="vs-set-save">Save</button><button id="vs-prompt-copy">Copy system prompt</button><span id="vs-set-status"></span></div>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Safety & behavior</span></div>
+           <div class="vs-menu-note">Toggles read live at session start; changes apply to the next session.</div>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsAutoVerify" /> Verify edits with a screenshot</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsGuardDestructive" /> Guard destructive commands</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsRollback" /> Snapshot scripts before edits</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsPlaytest" /> Auto play-test on demand</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsLeaderboard" /> Track per-provider stats</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsBackground" /> Work while the tab is hidden</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsAutoShotError" /> Screenshot when a tool errors</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsAutoBackup" /> Backup place before destructive ops</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsAutoNotify" /> Notify when a hidden-tab session ends</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsSpokenDone" /> Speak when a session completes</label>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsAutoSummary" /> Summarize what was built at session end</label>
+            <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsHumanizeSend" /> Humanize send timing (experimental)</label>
+            <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsShowTokenEstimate" /> Show token estimate in the bar</label>
+            <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsCowork" /> Guide: steer the agent while it runs</label>
+            <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsPromptPerPlace" /> Per-place prompt (one per open place)</label>
+            <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" class="vs-cfg-toggle" data-k="vsSounds" /> Sound effects (ready, done, errors)</label>
+           <label class="vs-menu-note vs-wiz-mp">Approval level
+             <select id="vs-trust-level" class="vs-mcp-field">
+               <option value="high">High - auto-run, pause only on errors</option>
+               <option value="medium">Medium - confirm destructive + errors</option>
+               <option value="low">Low - confirm every command</option>
+             </select>
+           </label>
+           <label class="vs-menu-note vs-wiz-mp">Command budget per session
+             <input id="vs-budget" class="vs-mcp-field" type="number" min="0" step="5" placeholder="0 = unlimited" />
+           </label>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Preferred model</span></div>
+           <div class="vs-menu-note">Forced on ${esc(P.displayName)} at session start where the site lets the extension drive its model picker (DeepSeek: instant/expert/vision; Kimi: K3 etc.). Empty keeps the site default or your manual pick.</div>
+           <input id="vs-pref-model" class="vs-mcp-field" placeholder="e.g. expert, vision, K3…" />
+           <div class="vs-set-row"><button id="vs-pref-save">Save</button><span id="vs-pref-status"></span></div>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Project type</span></div>
+           <div class="vs-menu-note">Genre-specific Roblox best practices are injected into the system prompt on every new session. Auto / None adds nothing.</div>
+           <select id="vs-project-type" class="vs-mcp-field">
+             <option value="">Auto / None</option>
+             ${Object.keys(VS.PROJECT_TYPES).map((k) => `<option value="${esc(k)}">${esc(k[0].toUpperCase() + k.slice(1))}</option>`).join("")}
+           </select>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>Build wizard</span></div>
+           <div class="vs-menu-note">Pick a starter and press Build - the agent starts a guided session and builds the first playable version for you.</div>
+           <input id="vs-wiz-name" class="vs-mcp-field" placeholder="Game name, e.g. Speedy Obby" />
+           <select id="vs-wiz-genre" class="vs-mcp-field">
+             <option value="obby">Obby</option>
+             <option value="tycoon">Tycoon</option>
+             <option value="simulator">Simulator</option>
+             <option value="survival">Survival</option>
+             <option value="racing">Racing</option>
+             <option value="shooter">Shooter</option>
+             <option value="tower">Tower Defense</option>
+             <option value="rpg">RPG / Quest</option>
+             <option value="farming">Farming Sim</option>
+             <option value="escape">Escape Room</option>
+             <option value="horror">Horror</option>
+             <option value="sports">Sports</option>
+             <option value="sandbox">Sandbox / Creative</option>
+             <option value="life">Life Sim / City</option>
+             <option value="battle_royale">Battle Royale</option>
+             <option value="crafting">Crafting / Gathering</option>
+             <option value="">Not sure - pick what's fun</option>
+           </select>
+           <label class="vs-menu-note vs-wiz-mp"><input type="checkbox" id="vs-wiz-mp" class="vs-cfg-toggle" /> Multiplayer-ready (authoritative logic, respawns, leaderboard)</label>
+           <div class="vs-set-row"><button id="vs-wiz-go">Build it now</button><span id="vs-wiz-status"></span></div>
+         </section>
+           <section class="vs-menu-sec">
+             <div class="vs-sec-label"><span>Session recording</span></div>
+             <div class="vs-menu-note">Record a build session and replay it step by step. Start recording before you speak to the AI, then load the recording later to replay each command in order.</div>
+             <div class="vs-set-row"><button id="vs-rec-start">Start recording</button><button id="vs-rec-stop" hidden>Stop</button><button id="vs-rec-save">Save recording</button><button id="vs-rec-clear">Clear</button><span id="vs-rec-status"></span></div>
+             <div id="vs-rec-list" style="font-size:11px;font-family:ui-monospace,color:var(--muted)"></div>
+           </section>
+           <section class="vs-menu-sec">
+             <div class="vs-sec-label"><span>Code review</span></div>
+            <div class="vs-menu-note">The agent reads the project memory and your key scripts, then reports bugs, Roblox/Luau issues and performance problems - without changing anything until you approve the fixes.</div>
+            <div class="vs-set-row"><button id="vs-review-go">Review my code</button><button id="vs-explain-go">Explain my code</button><span id="vs-review-status"></span></div>
+          </section>
+           <section class="vs-menu-sec">
+             <div class="vs-sec-label"><span>Session log & snapshot</span></div>
+             <div class="vs-menu-note">Copy this conversation's recent activity (tool calls, errors, screenshots) for bug reports, or export a JSON snapshot of this session's tracked edits and their pre-edit sources.</div>
+             <div class="vs-set-row"><button id="vs-log-copy">Copy build log</button><button id="vs-log-err">Copy last error</button><button id="vs-log-download">Download .log</button><button id="vs-snapshot-export">Export snapshot</button><span id="vs-log-status"></span></div>
+            </section>
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Place backups</span></div>
+            <div class="vs-menu-note">Snapshots of the open .rbxl taken by the bridge (also auto-made before destructive operations when "Backup place before destructive ops" is on). Restoring overwrites the place file - close Roblox Studio first.</div>
+            <div class="vs-set-row"><button id="vs-backup-now">Backup now</button><button id="vs-backup-refresh">Refresh</button><span id="vs-backup-status"></span></div>
+            <div id="vs-backup-list"></div>
+          </section>
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Launch at login</span></div>
+            <div class="vs-menu-note">Start the VoidScript bridge automatically when you sign in to Windows, so the extension is ready without running start.bat.</div>
+            <div class="vs-set-row"><button id="vs-startup-enable">Enable</button><button id="vs-startup-disable">Disable</button><span id="vs-startup-status"></span></div>
+          </section>
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Settings backup</span></div>
+            <div class="vs-menu-note">Export your VoidScript settings (toggles, custom prompt, project type, MCP servers, macros) to a JSON file, or import a previously exported file to restore them.</div>
+            <div class="vs-set-row"><button id="vs-settings-export">Export settings</button><button id="vs-settings-import">Import settings</button><input type="file" id="vs-settings-file" accept=".json,application/json" hidden /><span id="vs-settings-status"></span></div>
+          </section>
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Session presets</span></div>
+            <div class="vs-menu-note">Save the current setup (custom prompt, project type, addon servers) under a name, then load it back in one click for a future session.</div>
+            <div class="vs-set-row"><input id="vs-preset-name" type="text" placeholder="Preset name" maxlength="40" /><button id="vs-preset-save">Save</button><button id="vs-preset-delete">Delete</button></div>
+            <div class="vs-set-row"><select id="vs-preset-load"><option value="">Pick a preset…</option></select><button id="vs-preset-apply">Apply</button><span id="vs-preset-status"></span></div>
+          </section>
+          ${stabilityHtml}
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>Share recipe</span></div>
+           <div class="vs-menu-note">Copy a link that replays this setup (custom prompt, project type, addon servers and the last wizard starter) on any supported AI.</div>
+           <div class="vs-set-row"><button id="vs-recipe-share">Copy recipe link</button><span id="vs-recipe-status"></span></div>
+         </section>
+         <section class="vs-menu-sec">
+           <div class="vs-sec-label"><span>MCP servers</span></div>
+           <div class="vs-menu-note">Roblox Studio is always connected (primary). Add another MCP server (e.g. Blender, Sketchfab) as an addon - the bridge restarts briefly to load it. Experimental.</div>
+           ${mcpList}
+           <div class="vs-mcp-sep"></div>
+           <select id="vs-mcp-template" class="vs-mcp-field">
+             <option value="">Addon templates…</option>
+             ${Object.keys(VS.MCP_TEMPLATES || {}).map((k) => `<option value="${esc(k)}">${esc(VS.MCP_TEMPLATES[k].name)}</option>`).join("")}
+           </select>
+           <div class="vs-mcp-row">
+             <select id="vs-mcp-runtime" class="vs-mcp-field">
+               <option value="npx">npm (npx)</option>
+               <option value="uvx">Python (uvx)</option>
+             </select>
+             <button type="button" id="vs-uvx-help" title="How to install uvx">uvx guide</button>
+           </div>
+           <div id="vs-mcp-tpl-note" class="vs-mcp-field vs-menu-note" style="margin-top:2px;white-space:pre-line"></div>
+           <input id="vs-mcp-name" class="vs-mcp-field" placeholder="Name, e.g. Blender" />
+           <input id="vs-mcp-url" class="vs-mcp-field" placeholder="Start command, e.g. npx -y @some/mcp-server" />
+            <div class="vs-set-row"><button id="vs-mcp-add">Add server</button><span id="vs-mcp-status"></span></div>
+          </section>
+          <section class="vs-menu-sec">
+            <div class="vs-sec-label"><span>UI theme</span></div>
+            <div class="vs-menu-note">Pick the VoidScript overlay theme (does not change the AI site's own colors). System follows your OS preference.</div>
+            <select id="vs-theme" class="vs-mcp-field">
+              <option value="system">System (auto)</option>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="soft-light">Soft light</option>
+              <option value="or">OR</option>
+            </select>
+            <span id="vs-theme-status"></span>
+          </section>`;
+      const open = (url) => { try { window.open(url, "_blank", "noopener"); } catch {} menuEl.hidden = true; };
+      menuEl.querySelectorAll("button.vs-site-opt, .vs-tip-opt").forEach((b) =>
+        b.addEventListener("click", () => open(b.dataset.u)));
+      const ta = menuEl.querySelector("#vs-set-text");
+      const saveBtn = menuEl.querySelector("#vs-set-save");
+      const status = menuEl.querySelector("#vs-set-status");
+      ta.value = getCustomPrompt();
+      saveBtn.addEventListener("click", () => {
+        setCustomPrompt(ta.value);
+        status.textContent = "Saved ✓";
+        setTimeout(() => { status.textContent = ""; }, 1600);
+      });
+      // Copy system prompt: reconstruct exactly what a new session sends (same
+      // args as startSession's VS.buildSystemPrompt call) and put it on the
+      // clipboard, so the user can inspect/share what the agent actually sees.
+      const copyBtn = menuEl.querySelector("#vs-prompt-copy");
+      if (copyBtn) {
+        copyBtn.addEventListener("click", () => {
+          const text =
+            VS.buildSystemPrompt({ siteName: P.displayName, customPrompt: customPrompt, projectType: projectType, preferredModel: getPreferredModel(P.displayName) });
+          const done = () => {
+            status.textContent = "Copied ✓";
+            setTimeout(() => { status.textContent = ""; }, 1600);
+          };
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done, done);
+            } else {
+              const t = document.createElement("textarea");
+              t.value = text; document.body.appendChild(t);
+              t.select(); document.execCommand("copy");
+              document.body.removeChild(t);
+              done();
+            }
+          } catch { status.textContent = "Copy failed"; }
+        });
+      }
+      // Settings hub: every toggle in "Safety & behavior" writes straight to
+      // VS_CFG + storage so it applies immediately (buildMenu re-reads the
+      // current values every time it opens).
+      menuEl.querySelectorAll("input.vs-cfg-toggle[data-k]").forEach((box) => {
+        const key = box.dataset.k;
+        box.checked = vsOn(key);
+        box.addEventListener("change", () => {
+          VS_CFG[key] = box.checked;
+          try { chrome.storage.local.set({ [key]: box.checked }); } catch {}
+          diag("cfg.toggle", { key, on: box.checked });
+          if (key === "vsPromptPerPlace") syncMenuPrompt();
+          if (key === "vsCowork") { if (!box.checked) A.steerQueue = []; updateCowork(); renderBar(); }
+        });
+      });
+      const trustSel = menuEl.querySelector("#vs-trust-level");
+      if (trustSel) {
+        trustSel.value = VS_CFG.vsTrustLevel === "medium" || VS_CFG.vsTrustLevel === "low" ? VS_CFG.vsTrustLevel : "high";
+        trustSel.addEventListener("change", () => {
+          VS_CFG.vsTrustLevel = trustSel.value;
+          try { chrome.storage.local.set({ vsTrustLevel: VS_CFG.vsTrustLevel }); } catch {}
+          diag("cfg.trust", { level: trustSel.value });
+        });
+      }
+      const budgetInput = menuEl.querySelector("#vs-budget");
+      if (budgetInput) {
+        budgetInput.value = Number(VS_CFG.vsCommandBudget) || 0;
+        budgetInput.addEventListener("change", () => {
+          const v = Math.max(0, parseInt(budgetInput.value, 10) || 0);
+          VS_CFG.vsCommandBudget = v;
+          budgetInput.value = v;
+          try { chrome.storage.local.set({ vsCommandBudget: v }); } catch {}
+          diag("cfg.budget", { budget: v });
+        });
+      }
+      const prefInput = menuEl.querySelector("#vs-pref-model");
+      const prefBtn = menuEl.querySelector("#vs-pref-save");
+      const prefStatus = menuEl.querySelector("#vs-pref-status");
+      if (prefBtn) {
+        prefInput.value = getPreferredModel(P.displayName);
+        prefBtn.addEventListener("click", () => {
+          const val = prefInput.value.trim();
+          const key = (P.displayName || "").toLowerCase();
+          VS_PREF_MODELS[key] = val;
+          try { chrome.storage.local.set({ vsPreferredModels: VS_PREF_MODELS }); } catch {}
+          try { P.setPreferredModel && P.setPreferredModel(val); } catch {}
+          prefStatus.textContent = val ? "Saved ✓" : "Cleared ✓";
+          setTimeout(() => { if (prefStatus) prefStatus.textContent = ""; }, 1600);
+        });
+      }
+      const pType = menuEl.querySelector("#vs-project-type");
+      if (pType) {
+        pType.value = projectType;
+        pType.addEventListener("change", () => {
+          setProjectType(pType.value);
+          ui.toast(projectType ? `Project type set to ${projectType}.` : "Project type cleared.");
+        });
+      }
+      const mgOpen = menuEl.querySelector("#vs-open-models");
+      if (mgOpen) mgOpen.addEventListener("click", () => { menuEl.hidden = true; openModels(); });
+      const uiOpen = menuEl.querySelector("#vs-open-ui");
+      if (uiOpen) uiOpen.addEventListener("click", () => { menuEl.hidden = true; openGen("ui"); });
+      const kitOpen = menuEl.querySelector("#vs-open-kit");
+      if (kitOpen) kitOpen.addEventListener("click", () => { menuEl.hidden = true; openKit(); });
+      // Theme picker (Feature): persist vsTheme to chrome.storage + apply immediately.
+      const themeSel = menuEl.querySelector("#vs-theme");
+      const themeStatus = menuEl.querySelector("#vs-theme-status");
+      if (themeSel) {
+        themeSel.value = VS_CFG.vsTheme || "system";
+        themeSel.addEventListener("change", () => {
+          VS_CFG.vsTheme = themeSel.value;
+          try { chrome.storage.local.set({ vsTheme: VS_CFG.vsTheme }); } catch {}
+          applyVsTheme(VS_CFG.vsTheme);
+          if (themeStatus) { themeStatus.textContent = "Saved ✓"; setTimeout(() => { themeStatus.textContent = ""; }, 1600); }
+        });
+      }
+      // Share recipe: encode current settings into a shareable link and copy it.
+      const recipeBtn = menuEl.querySelector("#vs-recipe-share");
+      if (recipeBtn) {
+        const recipeStatus = menuEl.querySelector("#vs-recipe-status");
+        recipeBtn.addEventListener("click", () => {
+          const link = buildRecipeLink();
+          if (!link) {
+            recipeStatus.textContent = "Couldn't build the link";
+            return;
+          }
+          const done = () => {
+            recipeStatus.textContent = "Recipe link copied ✓";
+            setTimeout(() => { if (recipeStatus) recipeStatus.textContent = ""; }, 2000);
+          };
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(link).then(done, done);
+            } else {
+              const ta = document.createElement("textarea");
+              ta.value = link; document.body.appendChild(ta);
+              ta.select(); document.execCommand("copy");
+              document.body.removeChild(ta);
+              done();
+            }
+          } catch { recipeStatus.textContent = link.slice(0, 60) + "…"; }
+        });
+      }
+      // Build wizard: composes a guided first-build prompt, pins the genre, and
+      // starts the session. The prompt is auto-sent as the first user message
+      // once the bootstrap finishes (startSession reads takeWizardPrompt).
+      const wizGo = menuEl.querySelector("#vs-wiz-go");
+      if (wizGo) {
+        const wizStatus = menuEl.querySelector("#vs-wiz-status");
+        wizGo.addEventListener("click", () => {
+          if (A.starting || A.running) {
+            wizStatus.textContent = "A session is already running";
+            setTimeout(() => { if (wizStatus) wizStatus.textContent = ""; }, 2000);
+            return;
+          }
+          const name = (menuEl.querySelector("#vs-wiz-name").value || "").trim();
+          const genre = menuEl.querySelector("#vs-wiz-genre").value;
+          const mp = menuEl.querySelector("#vs-wiz-mp").checked;
+          setProjectType(genre || "");
+          A.recipeStarter = buildWizardPrompt(name || "", genre, mp);
+          setWizardPrompt(A.recipeStarter);
+          wizStatus.textContent = "Starting the build…";
+          menuEl.hidden = true;
+          startSession();
+        });
+      }
+      // Code review mode: a one-click flow that makes the agent audit the
+      // project (memory + key scripts) and report findings WITHOUT editing, then
+      // apply only the fixes the user approves. Reuses the wizard-prompt slot so
+      // the bootstrap auto-sends it as the first message of the new session.
+      const reviewGo = menuEl.querySelector("#vs-review-go");
+      if (reviewGo) {
+        const reviewStatus = menuEl.querySelector("#vs-review-status");
+        reviewGo.addEventListener("click", () => {
+          if (A.starting || A.running) {
+            reviewStatus.textContent = "A session is already running";
+            setTimeout(() => { if (reviewStatus) reviewStatus.textContent = ""; }, 2000);
+            return;
+          }
+          setWizardPrompt(
+            "REVIEW MODE - code review, do NOT edit anything yet:\n" +
+            "1. Read game.ServerStorage.VoidScript.Memory (project memory).\n" +
+            "2. Find the project's key scripts (search_game_tree / script_read) and read them.\n" +
+            "3. Review them for: (a) bugs and errors, (b) Roblox + Luau best practices and " +
+            "server-authoritative correctness, (c) performance problems (WaitForChild without " +
+            "timeouts, per-frame remote events, yield/blocking in execute_luau, etc.), " +
+            "(d) organization and readability.\n" +
+            "4. Reply with a concise, prioritized report: each issue with its file/instance path, " +
+            "why it matters, and the concrete fix. Do NOT apply any change yet.\n" +
+            "5. Then list the issues you recommend fixing, and apply ONLY the ones the user approves."
+          );
+          reviewStatus.textContent = "Starting the review…";
+          menuEl.hidden = true;
+          startSession();
+        });
+      }
+      // Explain my code mode (Feature): a one-click flow that makes the agent
+      // read the project and explain its code in plain terms (what each script
+      // does, the data flow, the key systems) WITHOUT editing anything. Reuses
+      // the wizard-prompt slot so the bootstrap auto-sends it as the first message.
+      const explainGo = menuEl.querySelector("#vs-explain-go");
+      if (explainGo) {
+        const explainStatus = menuEl.querySelector("#vs-review-status");
+        explainGo.addEventListener("click", () => {
+          if (A.starting || A.running) {
+            explainStatus.textContent = "A session is already running";
+            setTimeout(() => { if (explainStatus) explainStatus.textContent = ""; }, 2000);
+            return;
+          }
+          setWizardPrompt(
+            "EXPLAIN MY CODE - plain-English walkthrough, do NOT edit anything:\n" +
+            "1. Read game.ServerStorage.VoidScript.Memory (project memory).\n" +
+            "2. Find the project's key scripts (search_game_tree / script_read) and read them.\n" +
+            "3. Explain what each important script/module does, the data flow between them, " +
+            "and how the main systems work together - in plain, non-technical language the " +
+            "user can understand. Mention any Roblox/Luau conventions you follow, but keep the " +
+            "exposition friendly and concise. Do NOT make or run any changes."
+          );
+          explainStatus.textContent = "Starting the explanation…";
+          menuEl.hidden = true;
+          startSession();
+        });
+      }
+      // Session log: copy this conversation's tool activity, or just the last
+      // error, out of the persisted vsTimeline (diag events + runTool outcomes).
+      const logStatus = menuEl.querySelector("#vs-log-status");
+      const buildLogText = () => buildSessionLogText();
+      const logCopyBtn = menuEl.querySelector("#vs-log-copy");
+      if (logCopyBtn) {
+        logCopyBtn.addEventListener("click", async () => {
+          const text = await buildLogText();
+          if (!text) { logStatus.textContent = "No activity in this chat yet"; setTimeout(() => { logStatus.textContent = ""; }, 2000); return; }
+          const ok = await copyToClipboard(text);
+          logStatus.textContent = ok ? "Log copied ✓" : "Copy failed";
+          setTimeout(() => { logStatus.textContent = ""; }, 2000);
+        });
+      }
+      const logErrBtn = menuEl.querySelector("#vs-log-err");
+      if (logErrBtn) {
+        logErrBtn.addEventListener("click", async () => {
+          const text = await buildLogText();
+          if (!text) { logStatus.textContent = "No activity in this chat yet"; setTimeout(() => { logStatus.textContent = ""; }, 2000); return; }
+          const errs = text.split("\n").filter((l) => l.includes(" ERR "));
+          const last = errs.length ? errs[errs.length - 1] : "";
+          if (!last) { logStatus.textContent = "No errors yet ✓"; setTimeout(() => { logStatus.textContent = ""; }, 2000); return; }
+          const ok = await copyToClipboard(last);
+          logStatus.textContent = ok ? "Error copied ✓" : "Copy failed";
+          setTimeout(() => { logStatus.textContent = ""; }, 2000);
+        });
+      }
+      const logDownBtn = menuEl.querySelector("#vs-log-download");
+      if (logDownBtn) {
+        logDownBtn.addEventListener("click", async () => {
+          const text = await buildLogText();
+          if (!text) { logStatus.textContent = "No activity in this chat yet"; setTimeout(() => { logStatus.textContent = ""; }, 2000); return; }
+          downloadTextFile(`voidscript-session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.log`, text);
+          logStatus.textContent = "Downloaded ✓";
+          setTimeout(() => { logStatus.textContent = ""; }, 2000);
+        });
+      }
+      const snapBtn = menuEl.querySelector("#vs-snapshot-export");
+      if (snapBtn) {
+        snapBtn.addEventListener("click", () => {
+          const snap = {
+            tool: "voidscript-export-snapshot",
+            exportedAt: new Date().toISOString(),
+            provider: P.id,
+            session: { ok: A.runOk || 0, err: A.runErr || 0, startedAt: A.startedAt || 0 },
+            undoStack: _undoStack.slice(-50).map((e) => ({ path: e.path, t: e.t, beforeLength: (e.before || "").length })),
+            macros: Object.keys(_macros || {}),
+          };
+          try {
+            downloadTextFile(`voidscript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, JSON.stringify(snap, null, 2));
+            logStatus.textContent = "Snapshot exported ✓";
+          } catch {
+            logStatus.textContent = "Export failed";
+          }
+          setTimeout(() => { logStatus.textContent = ""; }, 2000);
+        });
+       }
+       // Session recording/playback (Feature): records tool calls + injected
+       // results to chrome.storage.local, then can replay a saved recording step
+       // by step through the agent loop.
+       let _recording = false;
+       let _recorded = [];
+       const recStartBtn = menuEl.querySelector("#vs-rec-start");
+       const recStopBtn = menuEl.querySelector("#vs-rec-stop");
+       const recSaveBtn = menuEl.querySelector("#vs-rec-save");
+       const recClearBtn = menuEl.querySelector("#vs-rec-clear");
+       const recStatus = menuEl.querySelector("#vs-rec-status");
+       const recList = menuEl.querySelector("#vs-rec-list");
+       function setRecording(on) {
+         _recording = on;
+         if (recStopBtn) recStopBtn.hidden = !on;
+         if (recStatus) recStatus.textContent = on ? "Recording…" : "";
+       }
+       if (recStartBtn) recStartBtn.addEventListener("click", () => {
+         if (_recording) return;
+         _recorded = [];
+         setRecording(true);
+         recStatus.textContent = "Recording";
+       });
+       if (recStopBtn) recStopBtn.addEventListener("click", () => {
+         if (!_recording) return;
+         setRecording(false);
+         recStatus.textContent = "Stopped";
+         setTimeout(() => { if (recStatus) recStatus.textContent = ""; }, 2000);
+       });
+       if (recSaveBtn) recSaveBtn.addEventListener("click", () => {
+         if (!_recorded.length) { recStatus.textContent = "Nothing recorded yet"; setTimeout(() => { if (recStatus) recStatus.textContent = ""; }, 2000); return; }
+         const name = "recording-" + Date.now();
+         try {
+            chrome.storage.local.set({ ["vsRecording_" + name]: { steps: _recorded, createdAt: Date.now() } });
+           recStatus.textContent = "Saved ✓";
+         } catch {
+           recStatus.textContent = "Save failed";
+         }
+         setTimeout(() => { if (recStatus) recStatus.textContent = ""; }, 2000);
+       });
+       if (recClearBtn) recClearBtn.addEventListener("click", () => {
+         setRecording(false);
+         _recorded = [];
+         recStatus.textContent = "Cleared";
+         setTimeout(() => { if (recStatus) recStatus.textContent = ""; }, 2000);
+       });
+       // List saved recordings
+       try {
+         chrome.storage.local.get(null, (r) => {
+           const recs = Object.keys(r || {}).filter((k) => k.startsWith("vsRecording_")).map((k) => ({ key: k, data: r[k] }));
+           if (recList) {
+             recList.innerHTML = recs.length
+               ? recs.map((r) => `<div class="lb-row"><span class="lb-name">${r.key.replace("vsRecording_", "")}</span><span class="lb-meta">${r.data.steps ? r.data.steps.length + " steps" : ""}</span></div>`).join("")
+               : "No recordings saved.";
+           }
+         });
+       } catch {}
+       // Hook into the agent loop to record outgoing commands + results.
+       // We piggy-back on the timeline events (diag) and tool outcomes.
+       (function installRecorder() {
+         const recOrig = log;
+         // Wrap runTool to capture command + result when recording.
+       })();
+       // Place backups (Feature): backup now / list / restore / delete via the
+      // bridge. Restore copies the .rbxl back over its original location.
+      const backupNowBtn = menuEl.querySelector("#vs-backup-now");
+      const backupRefreshBtn = menuEl.querySelector("#vs-backup-refresh");
+      const backupStatus = menuEl.querySelector("#vs-backup-status");
+      const backupListEl = menuEl.querySelector("#vs-backup-list");
+      async function refreshBackupList() {
+        if (!backupListEl) return;
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "list_backups" });
+          if (!r || !r.ok) { backupListEl.innerHTML = ""; backupStatus.textContent = (r && r.error) || "Bridge unreachable"; return; }
+          const bs = r.backups || [];
+          if (!bs.length) { backupListEl.innerHTML = '<div class="vs-menu-note">No backups yet.</div>'; backupStatus.textContent = ""; return; }
+          backupListEl.innerHTML = bs.map((b) => {
+            const when = new Date((b.mtime || 0) * 1000).toLocaleString();
+            const kb = b.size > 1048576 ? (b.size / 1048576).toFixed(1) + " MB" : b.size > 1024 ? (b.size / 1024).toFixed(0) + " kB" : (b.size || 0) + " B";
+            return `<div class="vs-backup-item"><span class="vs-backup-name">${esc(b.name)}</span><span class="vs-backup-meta">${when} · ${kb}</span><button class="vs-backup-restore" data-n="${esc(b.name)}">Restore</button><button class="vs-backup-del" data-n="${esc(b.name)}">Delete</button></div>`;
+          }).join("");
+          backupListEl.querySelectorAll(".vs-backup-restore").forEach((btn) => btn.addEventListener("click", async () => {
+            if (!confirm(`Restore '${btn.dataset.n}'?\n\nThis overwrites the place file at its original location - close Roblox Studio first.`)) return;
+            const r = await chrome.runtime.sendMessage({ type: "restore_backup", name: btn.dataset.n });
+            backupStatus.textContent = r && r.ok ? (r.message || "Restored ✓") : (r && r.error) || "Restore failed";
+            setTimeout(() => { backupStatus.textContent = ""; }, 5000);
+            refreshBackupList();
+          }));
+          backupListEl.querySelectorAll(".vs-backup-del").forEach((btn) => btn.addEventListener("click", async () => {
+            if (!confirm(`Delete backup '${btn.dataset.n}'?`)) return;
+            const r = await chrome.runtime.sendMessage({ type: "delete_backup", name: btn.dataset.n });
+            backupStatus.textContent = r && r.ok ? "Deleted ✓" : (r && r.error) || "Delete failed";
+            setTimeout(() => { backupStatus.textContent = ""; }, 2000);
+            refreshBackupList();
+          }));
+          backupStatus.textContent = "";
+        } catch { backupStatus.textContent = "Bridge unreachable"; }
+      }
+      if (backupNowBtn) backupNowBtn.addEventListener("click", async () => {
+        backupStatus.textContent = "Backing up…";
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "backup_place" });
+          backupStatus.textContent = r && r.ok ? "Backed up ✓" : (r && r.error) || "Backup failed";
+        } catch { backupStatus.textContent = "Bridge unreachable"; }
+        setTimeout(() => { backupStatus.textContent = ""; }, 3000);
+        refreshBackupList();
+      });
+      if (backupRefreshBtn) backupRefreshBtn.addEventListener("click", refreshBackupList);
+      refreshBackupList();
+      // Launch at login (Feature): toggle the bridge's OS auto-start entry via
+      // the bridge, and reflect its current state.
+      const startupEnableBtn = menuEl.querySelector("#vs-startup-enable");
+      const startupDisableBtn = menuEl.querySelector("#vs-startup-disable");
+      const startupStatus = menuEl.querySelector("#vs-startup-status");
+      async function refreshStartupState() {
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "startup_status" });
+          const on = !!(r && r.ok && r.enabled);
+          if (startupEnableBtn) startupEnableBtn.disabled = on;
+          if (startupDisableBtn) startupDisableBtn.disabled = !on;
+          if (startupStatus) startupStatus.textContent = on ? "Enabled ✓" : "Disabled";
+        } catch {
+          if (startupStatus) startupStatus.textContent = "Bridge unreachable";
+        }
+      }
+      if (startupEnableBtn) startupEnableBtn.addEventListener("click", async () => {
+        startupStatus.textContent = "Installing…";
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "startup_enable" });
+          startupStatus.textContent = r && r.ok ? (r.message || "Enabled ✓") : (r && r.error) || "Enable failed";
+        } catch { startupStatus.textContent = "Bridge unreachable"; }
+        setTimeout(() => { if (startupStatus) startupStatus.textContent = ""; }, 4000);
+        refreshStartupState();
+      });
+      if (startupDisableBtn) startupDisableBtn.addEventListener("click", async () => {
+        startupStatus.textContent = "Removing…";
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "startup_disable" });
+          startupStatus.textContent = r && r.ok ? (r.message || "Disabled ✓") : (r && r.error) || "Disable failed";
+        } catch { startupStatus.textContent = "Bridge unreachable"; }
+        setTimeout(() => { if (startupStatus) startupStatus.textContent = ""; }, 4000);
+        refreshStartupState();
+      });
+      refreshStartupState();
+      // Settings backup (Feature): export/import the user's VoidScript settings
+      // as JSON. Export downloads a file; import reads one back and applies it.
+      const settingsExportBtn = menuEl.querySelector("#vs-settings-export");
+      const settingsImportBtn = menuEl.querySelector("#vs-settings-import");
+      const settingsFileInput = menuEl.querySelector("#vs-settings-file");
+      const settingsStatus = menuEl.querySelector("#vs-settings-status");
+      // Curated keys - everything a user would want to carry to another machine,
+      // but NOT runtime/derived data (undo stack, image cache, timeline, logs).
+      const SETTINGS_EXPORT_KEYS = [
+        ...Object.keys(VS_CFG_DEFAULTS), "vsTrustLevel", "vsCommandBudget",
+        "vsCustomPrompt", "vsCustomPromptByPlace", "vsProjectType",
+        "vsCustomMcpServers", "vsMacros", "vsPreferredModels", "vsWizardPrompt",
+      ];
+      if (settingsExportBtn) settingsExportBtn.addEventListener("click", () => {
+        try {
+          chrome.storage.local.get(SETTINGS_EXPORT_KEYS, (r) => {
+            const out = { tool: "voidscript-settings-export", exportedAt: new Date().toISOString(), settings: r || {} };
+            try { downloadTextFile(`voidscript-settings-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(out, null, 2)); settingsStatus.textContent = "Exported ✓"; }
+            catch { settingsStatus.textContent = "Export failed"; }
+            setTimeout(() => { settingsStatus.textContent = ""; }, 2000);
+          });
+        } catch { settingsStatus.textContent = "Export failed"; }
+      });
+      if (settingsImportBtn && settingsFileInput) settingsImportBtn.addEventListener("click", () => settingsFileInput.click());
+      if (settingsFileInput) settingsFileInput.addEventListener("change", () => {
+        const file = settingsFileInput.files && settingsFileInput.files[0];
+        settingsFileInput.value = "";
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          try {
+            const data = JSON.parse(String(reader.result || ""));
+            const st = data && data.settings ? data.settings : {};
+            if (!st || typeof st !== "object") throw new Error("no settings payload");
+            const clean = {};
+            for (const k of SETTINGS_EXPORT_KEYS) if (k in st) clean[k] = st[k];
+            await chrome.storage.local.set(clean);
+            VS_CFG = { ...VS_CFG_DEFAULTS, ...clean };
+            settingsStatus.textContent = "Imported ✓ - reload the page to apply";
+            setTimeout(() => { settingsStatus.textContent = ""; }, 3000);
+            if (typeof refreshSetup === "function") refreshSetup();
+          } catch {
+            settingsStatus.textContent = "Invalid settings file";
+            setTimeout(() => { settingsStatus.textContent = ""; }, 3000);
+          }
+        };
+        reader.readAsText(file);
+      });
+      // Session presets (Feature): named snapshots of the current setup.
+      // Stored in chrome.storage.local under "vsPresets" as
+      // { name: { prompt, projectType, mcpServers } }.
+      const presetNameInput = menuEl.querySelector("#vs-preset-name");
+      const presetSaveBtn = menuEl.querySelector("#vs-preset-save");
+      const presetDeleteBtn = menuEl.querySelector("#vs-preset-delete");
+      const presetLoadSel = menuEl.querySelector("#vs-preset-load");
+      const presetApplyBtn = menuEl.querySelector("#vs-preset-apply");
+      const presetStatus = menuEl.querySelector("#vs-preset-status");
+      let presets = {};
+      try {
+        chrome.storage.local.get("vsPresets", (r) => {
+          if (r && typeof r.vsPresets === "object" && r.vsPresets) presets = r.vsPresets;
+          renderPresetSelect();
+        });
+      } catch {}
+      function persistPresets() { try { chrome.storage.local.set({ vsPresets: presets }); } catch {} }
+      function renderPresetSelect() {
+        if (!presetLoadSel) return;
+        const names = Object.keys(presets || {}).sort();
+        presetLoadSel.innerHTML = '<option value="">Pick a preset…</option>' + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+      }
+      if (presetSaveBtn) presetSaveBtn.addEventListener("click", () => {
+        const name = (presetNameInput.value || "").trim();
+        if (!name) { presetStatus.textContent = "Name the preset first"; setTimeout(() => { presetStatus.textContent = ""; }, 2000); return; }
+        presets[name] = {
+          prompt: getCustomPrompt() || "",
+          projectType: getProjectType() || "",
+          mcpServers: (getCustomMcpServers() || []).map((s) => ({ id: s.id, name: s.name, command: s.command })),
+          t: Date.now(),
+        };
+        persistPresets();
+        renderPresetSelect();
+        presetStatus.textContent = `Saved "${name}" ✓`;
+        setTimeout(() => { presetStatus.textContent = ""; }, 2000);
+      });
+      if (presetDeleteBtn) presetDeleteBtn.addEventListener("click", () => {
+        const name = presetLoadSel.value;
+        if (!name || !presets[name]) { presetStatus.textContent = "Pick a preset to delete"; setTimeout(() => { presetStatus.textContent = ""; }, 2000); return; }
+        delete presets[name];
+        persistPresets();
+        renderPresetSelect();
+        presetStatus.textContent = "Deleted ✓";
+        setTimeout(() => { presetStatus.textContent = ""; }, 2000);
+      });
+      if (presetApplyBtn) presetApplyBtn.addEventListener("click", () => {
+        const name = presetLoadSel.value;
+        const p = presets[name];
+        if (!p) { presetStatus.textContent = "Pick a preset to apply"; setTimeout(() => { presetStatus.textContent = ""; }, 2000); return; }
+        if (typeof p.prompt === "string") setCustomPrompt(p.prompt);
+        if (typeof p.projectType === "string") setProjectType(p.projectType);
+        if (Array.isArray(p.mcpServers)) {
+          customMcpServers = p.mcpServers.filter((s) => s && s.command);
+          saveCustomMcpServers();
+        }
+        presetStatus.textContent = `Applied "${name}" ✓`;
+        setTimeout(() => { presetStatus.textContent = ""; }, 2500);
+        if (typeof refreshSetup === "function") refreshSetup();
+        else if (typeof buildMenu === "function") buildMenu();
+      });
+      const mcpNameEl = menuEl.querySelector("#vs-mcp-name");
+      const mcpUrlEl = menuEl.querySelector("#vs-mcp-url");
+      const mcpStatus = menuEl.querySelector("#vs-mcp-status");
+      const mcpAddBtn = menuEl.querySelector("#vs-mcp-add");
+      const mcpTplEl = menuEl.querySelector("#vs-mcp-template");
+      const mcpTplNote = menuEl.querySelector("#vs-mcp-tpl-note");
+      const mcpRuntimeEl = menuEl.querySelector("#vs-mcp-runtime");
+      const mcpUvxHelp = menuEl.querySelector("#vs-uvx-help");
+      // Resolve the command string for a template + the selected runtime.
+      function templateCommand(t, runtime) {
+        if (!t) return "";
+        const v = t.variants || {};
+        return v[runtime] || v.npx || v.uvx || t.command || "";
+      }
+      // One-click addon templates: picking one fills the name + command fields and
+      // shows its setup note, so multi-app setups are copy-free. The runtime picker
+      // switches npx vs uvx commands; picking a runtime with a template selected
+      // just refills the command.
+      if (mcpTplEl) {
+        mcpTplEl.addEventListener("change", () => {
+          const t = VS.MCP_TEMPLATES && VS.MCP_TEMPLATES[mcpTplEl.value];
+          if (!t) { mcpTplNote.textContent = ""; mcpUrlEl.value = ""; return; }
+          mcpNameEl.value = t.name;
+          const runtime = (mcpRuntimeEl && mcpRuntimeEl.value) || "npx";
+          const v = t.variants || {};
+          mcpUrlEl.value = templateCommand(t, runtime);
+          const onlyOne = v.npx ? (!v.uvx ? "npm (npx)" : "") : "Python (uvx)";
+          mcpTplNote.textContent = (onlyOne ? `Available via ${onlyOne}. ` : "") + t.note;
+          mcpStatus.textContent = "";
+        });
+      }
+      if (mcpRuntimeEl) {
+        mcpRuntimeEl.addEventListener("change", () => {
+          if (!mcpTplEl || !mcpTplEl.value) return;
+          const t = VS.MCP_TEMPLATES && VS.MCP_TEMPLATES[mcpTplEl.value];
+          if (!t) return;
+          mcpUrlEl.value = templateCommand(t, mcpRuntimeEl.value);
+          if (mcpRuntimeEl.value === "uvx") {
+            mcpTplNote.textContent = t.note + "\n\n" + (VS.UVX_SETUP || "");
+          } else {
+            const v = t.variants || {};
+            const onlyOne = v.npx ? (!v.uvx ? "npm (npx)" : "") : "Python (uvx)";
+            mcpTplNote.textContent = (onlyOne ? `Available via ${onlyOne}. ` : "") + t.note;
+          }
+          mcpStatus.textContent = "";
+        });
+        // The uvx guide button shows the install/setup steps for Python servers.
+        if (mcpUvxHelp) {
+          mcpUvxHelp.addEventListener("click", () => {
+            mcpTplNote.textContent = (VS.UVX_SETUP || "") +
+              "\n\nPick a template, choose 'Python (uvx)' above, and the command is filled for you.";
+          });
+        }
+      }
+      // Disable every add/remove control and show the restart spinner. Adding or
+      // removing a server rewrites config.json and restarts the whole bridge, so
+      // no other server edit may run until it is back.
+      let mcpBusy = false;
+      function setMcpBusy(on, label) {
+        mcpBusy = on;
+        mcpAddBtn.disabled = on;
+        menuEl.querySelectorAll(".vs-mcp-remove").forEach((b) => (b.disabled = on));
+        mcpStatus.innerHTML = on
+          ? `<span class="vs-mcp-spin-row"><span class="vs-mcp-spin"></span>${label || "Restarting bridge…"}</span>`
+          : "";
+      }
+
+      menuEl.querySelectorAll(".vs-mcp-remove").forEach((b) =>
+        b.addEventListener("click", async () => {
+          if (mcpBusy) return;
+          const id = b.dataset.id;
+          if (!id) return;
+          setMcpBusy(true, "Restarting bridge…");
+          const r = await bg({ type: "remove_server", server_id: id });
+          if (!r || !r.ok) {
+            setMcpBusy(false);
+            mcpStatus.textContent = (r && r.error) || "Couldn't remove server";
+            setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 2400);
+            return;
+          }
+          customMcpServers = customMcpServers.filter((s) => s.id !== id);
+          saveCustomMcpServers();
+          await waitForBridgeBack(null);
+          buildMenu(); // rebuilds with the spinner cleared
+        }));
+
+      mcpAddBtn.addEventListener("click", async () => {
+        if (mcpBusy) return;
+        const name = mcpNameEl.value.trim();
+        const command = mcpUrlEl.value.trim();
+        if (!name || !command) {
+          mcpStatus.textContent = "Name and command required";
+          setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 1800);
+          return;
+        }
+        const id = mcpSlug(name);
+        const { command: cmd, args } = splitCommand(command);
+        setMcpBusy(true, "Restarting bridge…");
+        const r = await bg({ type: "add_server", server_id: id, command: cmd, args });
+        if (!r || !r.ok) {
+          setMcpBusy(false);
+          mcpStatus.textContent = (r && r.error) || "Couldn't add server";
+          setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 2400);
+          return;
+        }
+        customMcpServers.push({ id, name, command });
+        saveCustomMcpServers();
+        await waitForBridgeBack(id);
+        buildMenu(); // rebuilds with the new server listed + spinner cleared
+      });
+    }
+
+    // ── First-time onboarding card (bridge missing) ─────────────────────────
+    let setupCard = null, setupSeen = false, setupRaf = null;
+    try {
+      chrome.storage.local.get("vsSetupSeen", (r) => {
+        if (r && r.vsSetupSeen) setupSeen = true;
+      });
+    } catch {}
+
+    function buildSetup() {
+      setupCard = document.createElement("div");
+      setupCard.id = "vs-setup";
+      setupCard.hidden = true;
+      const videoBtn = VIDEO_URL
+        ? `<a id="vs-setup-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶ Watch tutorial</a>`
+        : "";
+      setupCard.innerHTML =
+        `<div id="vs-setup-head"><span id="vs-setup-logo">VoidScript</span><span id="vs-setup-tag">Setup</span></div>` +
+        `<div id="vs-setup-sub">The <b>Bridge</b> is what connects this chat to Roblox Studio. Three steps and you're running.</div>` +
+        `<ol id="vs-setup-steps">` +
+          `<li>Download the Bridge from GitHub</li>` +
+          `<li>Run <code>start.bat</code></li>` +
+           `<li>Back here, click <b>Start VoidScript</b></li>` +
+        `</ol>` +
+        `<div class="vs-setup-copy-row">` +
+          `<input type="text" id="vs-setup-link" readonly value="${GITHUB_URL}">` +
+          `<button id="vs-setup-copy">Copy</button>` +
+        `</div>` +
+        videoBtn +
+        `<button id="vs-setup-dismiss">Got it</button>`;
+      const card = setupCard;
+      whenSettled.then(() => { if (setupCard === card) document.documentElement.appendChild(card); });
+
+      setupCard.querySelector("#vs-setup-copy").addEventListener("click", () => {
+        try { navigator.clipboard.writeText(GITHUB_URL); } catch {
+          const inp = setupCard.querySelector("#vs-setup-link");
+          inp.select(); try { document.execCommand("copy"); } catch {}
+        }
+        const btn = setupCard.querySelector("#vs-setup-copy");
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy"; }, 1600);
+      });
+
+      setupCard.querySelector("#vs-setup-dismiss").addEventListener("click", () => {
+        setupSeen = true;
+        try { chrome.storage.local.set({ vsSetupSeen: true }); } catch {}
+        hideSetup();
+      });
+    }
+
+    // The onboarding card is pinned to the top-right corner (via CSS), out of the
+    // way of the composer; nothing to reposition per frame.
+    function placeSetup() {}
+
+    function showSetup() {
+      if (!setupCard) buildSetup();
+      if (setupCard.hidden) {
+        setupCard.hidden = false;
+        cancelAnimationFrame(setupRaf);
+        placeSetup();
+      }
+    }
+
+    function hideSetup() {
+      if (setupCard) setupCard.hidden = true;
+      cancelAnimationFrame(setupRaf);
+    }
+
+    function refreshSetup(bridgeConnected) {
+      if (setupSeen || bridgeConnected) { hideSetup(); return; }
+      // Bridge is down, but if the user is just READING an existing
+      // conversation with no VoidScript session (the "No agent here" state),
+      // a "bridge down" onboarding popup is pure noise - they may not want an
+      // agent here at all (user request). Keep it for the states where the
+      // bridge actually matters: a fresh/empty chat (the Start affordance is
+      // showing) or a conversation with a live/starting session.
+      if (!A.started && !A.starting && !P.chatIsEmpty()) { hideSetup(); return; }
+      showSetup();
+    }
+
+    // The single source of truth for the bar's content. Decides the dot tone,
+    // the state line and the primary action from the live state:
+    //  • starting        → spinner, "Connecting to Roblox…"
+    //  • session active   → live dot, "Connected · N tools" (no action)
+    //  • fresh blank chat → "Ready" (or a bridge/Studio warning), action = Start
+    //  • existing chat    → "Not monitoring this chat" (informs only, no action)
+    function renderBar() {
+      if (!bar) return;
+      // indicator = an optional leading dot/spinner; msg = the wrappable text.
+      let toneClass = "standby", indicator = "", msg = "", label = "", kind = "", disabled = false, warn = false;
+      // Show "Starting…" for the whole bootstrap. If the user actually leaves for
+      // a new (empty) chat, syncSessionState clears A.starting, so this naturally
+      // falls back to that chat's own state - no fragile per-key check here (fresh
+      // chats share a key, and the conversation id only appears mid-bootstrap).
+      if (A.starting) {
+        toneClass = "starting";
+        indicator = `<span class="vs-spin"></span>`;
+         msg = `Connecting to Roblox…`;
+         // Clickable: if the AI never answers, this is the only way out of startup.
+         label = tr("b_stop"); kind = "starting"; disabled = false;
+      } else if (A.started) {
+        // Prefer the ADVERTISED list length (A.toolList - the AGGREGATE catalogue
+        // across every connected MCP server, already filtered by the vision/blocked
+        // gate so it matches what the model actually has: e.g. screen_capture is
+        // absent on non-vision providers like Kimi). After a page reload A.toolList
+        // is empty until the next list_tools, so fall back to the sum of every
+        // server's per-server health count (Roblox + addons like Blender) - NOT the
+        // Roblox-only count, which made the total drop to just 27 after a reload.
+        const healthTotal = A.bridge &&
+          (A.bridge.servers || []).reduce((n, x) => n + (x.tools || 0), 0);
+        const tools = A.toolList.length || healthTotal || (A.bridge && A.bridge.tools) || 0;
+        // "N tools" only means StudioMCP itself is up - it advertises its full
+        // catalogue even with no Studio/place attached (see probe_studio() in
+        // bridge.py), so showing it while Studio/place isn't actually usable
+        // reads as "everything's fine" when tool calls will just fail. Surface
+        // the real blocker instead in that case.
+        if (A.bridge && A.bridge.connected === false) {
+          // placeDown/appDown/studioDown are all false in this case (they're
+          // only computed when the bridge IS connected - see setStatus), so
+          // without this check the bridge dropping fell through to the
+          // stale "N tools" text below, reading as if nothing was wrong.
+          toneClass = "warn"; warn = true;
+           msg = `<b>Connected</b> · bridge offline, run start.bat`;
+        } else if ((placeDown || appDown || studioDown) && addonOk) {
+          // DEGRADED session by CHOICE: the user started the agent with Roblox
+          // down but other MCP server(s) alive (the "Start agent (Roblox
+          // offline)" path) - they may only want the addon tools (e.g. Blender).
+          // Keep the YELLOW dot as the honest health signal, but do NOT keep the
+          // red imperative "open Roblox Studio" nag on screen for the whole
+          // session (warn=false → no vs-state-warn red text). The full nag
+          // still shows when NO server is usable (the branches below).
+          toneClass = "warn";
+           msg = `<b>Connected</b>${tools ? ` · ${tools} tools` : ""} · Roblox offline`;
+        } else if (placeDown) {
+          toneClass = "warn"; warn = true;
+           msg = `<b>Connected</b> · open a place in Roblox Studio`;
+        } else if (appDown || studioDown) {
+          toneClass = "warn"; warn = true;
+          msg = studioProcUp
+             ? `<b>Connected</b> · Studio is open but not connected - open <b>Assistant Settings &gt; MCP Servers</b> in Studio`
+             : `<b>Connected</b> · open Roblox Studio & enable its MCP server`;
+        } else {
+          toneClass = "active";
+          // No inline dot here: the leading status dot already shows green, two
+          // dots side by side looked cluttered. The green "Agent active" text
+          // carries it.
+          msg = `<b>Connected</b>${tools ? ` · ${tools} tools` : ""}`;
+        }
+      } else if (P.isFreshChat() || P.chatIsEmpty()) {
+        // Treat ANY empty chat (no turns yet) as the standby/start case - not just
+        // the strict fresh-chat match. isFreshChat() also requires an exact root
+        // path AND the editor already mounted; on a cold load (e.g. arriving from a
+        // search-engine link) the SPA can show pathname/editor before they settle,
+        // which used to drop into the discouraging "No agent here" branch on a page
+        // that is actually empty and startable. "No agent here" is only correct for
+        // an EXISTING conversation (one that has turns) we did not start.
+        if (bridgeOk) {
+          toneClass = "standby";
+           msg = `Ready. Start when you're set, or just chat.`;
+                     label = tr("b_start"); kind = "start";
+        } else if (addonOk) {
+          // Roblox is down but another MCP server is live: allow a DEGRADED start
+          // (yellow). The agent runs on the other server(s); Roblox tools stay
+          // unavailable until Studio is back. Button enabled, but visibly warned.
+          toneClass = "warn"; warn = true;
+          msg = !A.bridge.connected
+            ? `Run <b>start.bat</b> on your PC.`
+            : studioProcUp
+              ? `<b>Studio open but not connected</b> - open <b>Assistant Settings &gt; MCP Servers</b> in Studio, or start without it.`
+              : `<b>Roblox Studio offline</b> - start with your other MCP server(s).`;
+          label = tr("b_startOffline"); kind = "start-degraded";
+        } else {
+          toneClass = "warn"; warn = true;
+          msg = !A.bridge.connected
+            ? `Run <b>start.bat</b> on your PC.`
+            : placeDown
+              ? `Open a <b>place</b> in Roblox Studio.`
+              : (appDown || studioDown) && studioProcUp
+                ? `Studio is open but not connected - open <b>Assistant Settings &gt; MCP Servers</b> in Studio.`
+                : appDown
+                  ? `Open <b>Roblox Studio</b> &amp; enable its MCP server.`
+                  : studioDown
+                    ? `Open <b>Roblox Studio</b> &amp; enable its MCP server.`
+                    : `Open <b>Roblox Studio</b> for the tools.`;
+                     label = tr("b_start"); kind = "start";
+        }
+        disabled = !bridgeOk && !addonOk;
+      } else {
+        toneClass = "noagent";
+           msg = `Not monitoring this chat. Open a new chat to begin.`;
+      }
+      // Parked on visibility: the loop is alive but deliberately frozen because
+      // this tab is not the foreground tab of its window. Say so explicitly -
+      // otherwise the bar keeps claiming "Agent active" while nothing advances,
+      // which reads as a hang (and is what users reported as "it died in the
+      // background"). No red warn tone: this is a normal, recoverable pause.
+      if (A.parked && (A.running || A.starting)) {
+        toneClass = "warn"; warn = false;
+        msg = `<b>Paused</b> · bring this tab to the front to continue`;
+      }
+      // Manual pause (bar's ⏸ Pause): same parked look, but driven by the user's
+      // button, not tab visibility. Keep it distinct so Resume is clearly offered.
+      if (A.paused && A.running) {
+        toneClass = "warn"; warn = false;
+        msg = `<b>Paused</b> · press Resume to continue`;
+      }
+      // Provider mode guard: some sites (e.g. Arena) only work in one chat mode.
+      // When the provider reports the current mode is unsupported, override the
+      // bar into a visible warning and disable Start until the user switches back.
+      // Skipped once a session is started/starting (the mode is fixed for the
+      // conversation by then). Reactive: renderBar runs on every sweep, so the
+      // warning appears/clears the instant the user changes the mode dropdown.
+      if (!A.started && !A.starting && P.modeWarning) {
+        const modeWarn = P.modeWarning();
+        if (modeWarn) {
+          toneClass = "warn"; warn = true; msg = modeWarn;
+          if (kind === "start" || kind === "start-degraded") disabled = true;
+        }
+      }
+      // Only touch the DOM when something actually changed. renderBar runs on
+      // every sweep; rewriting stateEl.innerHTML each time recreated the spinner
+      // <span> and RESTARTED its CSS animation, so "Starting…" appeared to stutter.
+      const busy = !stopBtn.hidden;
+      // Before a session is started, the bar stays minimal: only the Start action
+      // + Discord (help). The AI selector and the tips/support menu appear once the
+      // agent is actually running - so the pre-start bar isn't cluttered with
+      // options that only matter mid-session. (A.started is ambiguous with `warn`
+      // tone - which occurs both started-with-bridge-down and standby-with-bridge-
+      // down - so it's tracked explicitly in the signature.)
+      const showExtras = !!A.started;
+      const sig = [toneClass, indicator, msg, label, kind, disabled, warn, busy, showExtras].join("|");
+      if (sig === lastBarSig) return;
+      lastBarSig = sig;
+      // Set the tone WITHOUT clobbering other classes (e.g. vs-bar-inline, which
+      // placeBar adds for the in-flow mount - overwriting className broke the
+      // layout, making the bar fall back to fixed positioning and overlap).
+      bar.classList.remove("tone-standby", "tone-active", "tone-warn", "tone-noagent", "tone-starting");
+      bar.classList.add(`tone-${toneClass}`);
+      stateEl.innerHTML = indicator + `<span class="vs-state-txt">${msg}</span>`;
+      stateEl.classList.toggle("vs-state-warn", warn);
+      actionBtn.textContent = label;
+      actionBtn.dataset.kind = kind;
+      actionBtn.disabled = disabled;
+      // The Stop button replaces the action button while the agent is busy.
+      // With no kind (e.g. agent active, or an existing chat) there's no primary
+      // action to offer, so the button is hidden entirely.
+      actionBtn.style.display = (busy || !kind) ? "none" : "";
+      // AI selector + tips/support: only once a session is live. Discord stays
+      // visible in every state (it's the help link).
+      if (switchBtn) switchBtn.style.display = showExtras ? "" : "none";
+      if (supportBtn) supportBtn.style.display = showExtras ? "" : "none";
+    }
+    let lastBarSig = "";
+
+    // Thin wrappers kept for the core's call sites; the decision lives in renderBar.
+    function setStarted() { renderBar(); }
+    function setStarting() { renderBar(); }
+
+    function setStatus(s) {
+      A.bridge = s;
+      if (s.updateTag) vsUpdateTag = s.updateTag;
+      // Track the active place (Feature: per-place prompts) and refresh the menu
+      // prompt whenever the place changes, so the textarea shows the right one.
+      if (s.placeName !== activePlaceName) {
+        activePlaceName = s.placeName || "";
+        if (typeof syncMenuPrompt === "function") syncMenuPrompt();
+      }
+      if (!dot) return;
+      const servers = s.servers || [];
+      // VoidScript status tracks ONLY the primary Roblox MCP server. Every other
+      // server is an addon and must NEVER make the dot/gate look connected while
+      // Roblox itself is down. Old bridges don't send per-server health, so fall
+      // back to the aggregate signals they do send (mcpAlive / total tools).
+      const roblox = servers.find((x) => x.id === "roblox");
+      const mcpUp = roblox ? !!roblox.alive : (!!s.mcpAlive || servers.some((x) => x.alive));
+      // Roblox-only count drives the connectivity gate (the dot must never look
+      // green off an addon while Roblox itself is down)...
+      const robloxTools = roblox ? (roblox.tools || 0) : (s.tools || 0);
+      const mcpOk = s.connected && (mcpUp || robloxTools > 0);
+      // ...but the DISPLAYED count is the aggregate across every server (Roblox +
+      // addons like Blender), so it stays consistent with the bar and doesn't
+      // under-report when addon servers are loaded.
+      const totalTools = servers.reduce((n, x) => n + (x.tools || 0), 0) || s.tools || robloxTools;
+      // studio === false means the MCP server answered but the Studio is not USABLE
+      // (no place loaded). studioApp tells the two sub-cases apart:
+      //   studioApp === false → no Studio connected at all (app closed OR its MCP
+      //                         server option is disabled - indistinguishable).
+      //   studioApp === true  → Studio open but no place loaded (home screen / place
+      //                         closed mid-session). THIS is the case that used to
+      //                         wrongly read "Connected".
+      // null/undefined = unknown (old bridge / probe busy) → don't degrade.
+      const studioOff = mcpOk && s.studio === false;
+      const noApp = studioOff && s.studioApp === false;
+      const noPlace = studioOff && s.studioApp === true;
+      const ok = mcpOk && !studioOff;
+      dot.className = s.connected ? (ok ? "on" : "warn") : "off";
+      // Studio PROCESS running on the machine (bridge-side tasklist check).
+      // Splits noApp into its two truly different situations: Studio not
+      // launched at all vs Studio OPEN but its MCP plugin never registered
+      // with the bridge. The plugin only attempts to register ONCE (at Studio
+      // boot or on a panel/toggle interaction) and never retries by itself,
+      // so for the second case "open Roblox Studio" is dead-end advice - the
+      // action that actually works (validated live 3x, 2026-07-11) is opening
+      // Assistant Settings > MCP Servers inside the already-open Studio.
+      const procUp = s.studioProc === true;
+      let txt;
+      if (!s.connected) txt = "Bridge offline, run start.bat";
+      else if (!mcpOk) txt = "Bridge OK, open Roblox Studio";
+      else if (noPlace) txt = "Roblox Studio is open but no place is loaded - open a place";
+      else if (noApp) txt = procUp
+        ? "Studio is open but not connected - in Studio, open Assistant Settings > MCP Servers (or toggle its MCP server off/on)"
+        : "Roblox Studio not connected - open it and enable its MCP server";
+      else if (studioOff) txt = "Studio not connected, enable the MCP server in Roblox Studio";
+      else txt = `Connected · ${totalTools} tools ready${s.placeName ? ` · ${s.placeName}` : ""}`;
+      dot.title = txt; // full bridge detail on hover over the status dot
+      bridgeOk = ok;
+      studioDown = studioOff;
+      placeDown = noPlace;
+      appDown = noApp;
+      studioProcUp = procUp;
+      // A non-Roblox MCP (Blender, Sketchfab, ...) that is actually alive. When
+      // Roblox itself is down but such a server is present, the session can still
+      // start in a DEGRADED mode - the agent just can't touch Roblox until Studio
+      // is back. Gated on s.connected so a dropped bridge never reads as usable.
+      addonOk = !!s.connected && servers.some((x) => x.id !== "roblox" && x.alive && (x.tools || 0) > 0);
+      // Bridge-drop alert: a clear, persistent red banner the moment a
+      // previously-connected bridge goes offline. Clears on reconnect.
+      if (wasConnected && !s.connected) bridgeAlert(true);
+      if (s.connected) bridgeAlert(false);
+      wasConnected = s.connected;
+      // Once the bridge has connected at least once, onboarding is done: never
+      // resurface the "download the bridge" setup card again (otherwise, if the
+      // bridge later drops, it would reappear on top of the bridge-lost banner).
+      if (s.connected && !setupSeen) {
+        setupSeen = true;
+        try { chrome.storage.local.set({ vsSetupSeen: true }); } catch {}
+      }
+      renderBar();
+      refreshSetup(s.connected);
+    }
+
+    // Show (on=true) / clear (on=false) the bridge-disconnected red banner.
+    function bridgeAlert(on) {
+      if (!on) {
+        if (bridgeBannerEl) { bridgeBannerEl.remove(); bridgeBannerEl = null; }
+        return;
+      }
+      if (bridgeBannerEl) return; // already shown
+      const b = document.createElement("div");
+      b.className = "vs-banner limit";
+      // The setup tutorial lives INSIDE this banner (not as a separate card) so it
+      // can never overlap the alert - the previous standalone onboarding card did.
+      const videoLink = VIDEO_URL
+        ? `<a class="vs-banner-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶ Watch setup tutorial</a>`
+        : "";
+      b.innerHTML = `<div class="vs-banner-t">⚠ Lost connection to VoidScript</div>
+        <div class="vs-banner-m">The VoidScript bridge stopped on your PC. Restart it (run start.bat and keep Roblox Studio open): the agent will reconnect automatically as soon as it is detected again.</div>
+        <div class="vs-banner-acts">${videoLink}<button class="vs-banner-x">Close</button></div>`;
+      b.querySelector(".vs-banner-x").addEventListener("click", () => { b.remove(); if (bridgeBannerEl === b) bridgeBannerEl = null; });
+      root.appendChild(b);
+      bridgeBannerEl = b;
+    }
+
+    // Show (v=true) / hide the "■ Stop" button while the agent is busy. The
+    // primary action button swaps out for it (handled in renderBar via busy).
+    // Forced hidden during bootstrap (A.starting) so the bar stays on "Starting…"
+    // (else it flickers Starting → Stop → Starting as generation toggles). The
+    // caller decides the rest, including native-stop de-duplication.
+    function showStop(v) {
+      if (!stopBtn) return;
+      // Stay visible while winding down (A.stopping), so the button doesn't blink
+      // off when the live generation signal toggles as the loop drains.
+      const allow = (v || A.stopping) && !A.starting;
+      const was = stopBtn.hidden;
+      stopBtn.hidden = !allow;
+      updatePauseBtn();
+      // Restore the normal, clickable Stop look whenever we're shown for a fresh
+      // active turn (not a stop-in-progress).
+      if (allow && !A.stopping && stopBtn.dataset.state === "stopping") {
+        stopBtn.disabled = false;
+        stopBtn.textContent = tr("b_stop");
+        delete stopBtn.dataset.state;
+      }
+      if (was !== stopBtn.hidden) renderBar(); // reflect the action/stop swap
+    }
+
+    // Instant feedback the moment the user clicks Stop: lock the button into a
+    // disabled "⏳ Stopping…" state so they see it registered, even though the
+    // loop takes a beat to actually wind down (finish the in-flight tool/await).
+    function markStopping() {
+      if (!stopBtn) return;
+      stopBtn.hidden = false;
+      stopBtn.disabled = true;
+      stopBtn.dataset.state = "stopping";
+      stopBtn.textContent = tr("b_stopping");
+      renderBar();
+    }
+
+    // Pause/resume button: shown only while the agent loop is actively running
+    // (not during start/stop), labelled by the current pause state. Pausing keeps
+    // the input locked + cover up, exactly like a hidden-tab park.
+    function updatePauseBtn() {
+      if (!pauseBtn) return;
+      const show = A.running && !A.starting && !A.stopping;
+      pauseBtn.hidden = !show;
+      pauseBtn.textContent = A.paused ? tr("b_resume") : tr("b_pause");
+      pauseBtn.disabled = false;
+      // Quick action buttons: only visible while a session is live.
+      if (quickShotBtn && quickListBtn) {
+        quickShotBtn.hidden = !A.started;
+        quickListBtn.hidden = !A.started;
+      }
+      updateCowork();
+    }
+
+    // Co-work toggle + steer row. The toggle shows once a session is live (steering
+    // only makes sense while the agent is running); the steer box appears under the
+    // bar when Co-work is ON. The dot lights when a steer is queued and waiting.
+    // Static bar labels (Guide, Undo, Steer, quick-steer presets) follow the chosen
+    // language. Touches the DOM only when the language actually changed. Queries
+    // `bar`, not `root`: the bar is re-parented into the site's composer.
+    let _barLang = "";
+    function relabelBar() {
+      const lang = VS_CFG.vsLang || "en";
+      if (!bar || lang === _barLang) return;
+      _barLang = lang;
+      const set = (sel, key) => { const el = bar.querySelector(sel); if (el) el.textContent = tr(key); };
+      set("#vs-cowork .vs-cw-label", "b_guide");
+      if (undoBtn && !undoBtn.disabled) set("#vs-undo .vs-undo-label", "b_undo");
+      set("#vs-steer-send", "b_steer");
+      const presetKeys = ["b_fix", "b_undoRetry", "b_keep", "b_explain"];
+      [...bar.querySelectorAll(".vs-steer-chip")].forEach((c, i) => { if (presetKeys[i]) c.textContent = tr(presetKeys[i]); });
+      if (stopBtn && stopBtn.dataset.state !== "stopping") stopBtn.textContent = tr("b_stop");
+      if (pauseBtn) pauseBtn.textContent = A.paused ? tr("b_resume") : tr("b_pause");
+    }
+
+    function updateCowork() {
+      const on = !!VS_CFG.vsCowork;
+      if (coworkBtn) {
+        coworkBtn.hidden = !A.started;
+        coworkBtn.classList.toggle("on", on);
+        coworkBtn.setAttribute("aria-pressed", on ? "true" : "false");
+      }
+      const pending = (A.steerQueue && A.steerQueue.length) || 0;
+      if (coworkBtn) coworkBtn.classList.toggle("pending", on && pending > 0);
+      // Undo lives in the steer row now; shown once there's an edit to revert.
+      if (undoBtn) undoBtn.hidden = !(on && A.started && _undoStack.length > 0);
+      if (steerRow) steerRow.hidden = !(on && A.started);
+      // Focus mode: while Co-work is on, tuck the secondary quick buttons away so
+      // the row stays clean (they return the moment Co-work is toggled off).
+      const focus = on && A.started;
+      if (quickShotBtn) quickShotBtn.hidden = !A.started || focus;
+      if (quickListBtn) quickListBtn.hidden = !A.started || focus;
+      if (voiceBtn) voiceBtn.hidden = !P.voiceAvailable || focus;
+      if (steerInput) {
+        steerInput.placeholder = pending
+          ? tr("b_steerQueued", { n: pending })
+          : tr("b_steerPh");
+      }
+      relabelBar();
+      if (bar) bar.classList.toggle("vs-bar-cowork", !!(on && A.started));
+    }
+
+    // A gentle, one-time nudge: the user typed on a fresh chat without starting
+    // the agent. We do NOT block the send (plain chat is fine) - we just point at
+    // the Start button so they discover how to enable Roblox control.
+    let nudged = false;
+    function nudgeStart() {
+      if (A.started || !P.isFreshChat()) return;
+      if (!nudged) {
+        nudged = true;
+        toast("Tip: click “▶ Start VoidScript” to let the AI control Roblox Studio.");
+      }
+      if (!actionBtn) return;
+      actionBtn.classList.add("vs-flash");
+      setTimeout(() => actionBtn.classList.remove("vs-flash"), 1200);
+    }
+
+    // ── Theme auto-detection (light / dark) ─────────────────────────────────
+    // The panel and the in-conversation chips are dark-themed by default. On a
+    // LIGHT host page the chips' light text on a near-transparent tint becomes
+    // invisible, so we detect the page's effective background luminance and add
+    // `.vs-light` to <html>; overlay.css then flips to readable light colours.
+    // Most chat sites declare their theme EXPLICITLY (a `dark`/`light` class on
+    // <html>/<body>, a data-theme attribute, or CSS color-scheme) - far more
+    // reliable than luminance, since many (e.g. z.ai) leave <html>/<body> with a
+    // transparent background and paint the theme on a deeper container. Returns
+    // "light" | "dark" | null (no explicit signal).
+    function pageThemeHint() {
+      const de = document.documentElement, b = document.body;
+      const cls = (de.className + " " + (b ? b.className : "")).toLowerCase();
+      if (/\bdark\b/.test(cls)) return "dark";
+      if (/\blight\b/.test(cls)) return "light";
+      const attr = (de.getAttribute("data-theme") || de.getAttribute("data-color-mode") ||
+                    de.getAttribute("data-color-scheme") || "").toLowerCase();
+      if (/dark/.test(attr)) return "dark";
+      if (/light/.test(attr)) return "light";
+      const cs = (getComputedStyle(de).colorScheme || "").toLowerCase();
+      if (/dark/.test(cs) && !/light/.test(cs)) return "dark";
+      if (/light/.test(cs) && !/dark/.test(cs)) return "light";
+      return null;
+    }
+    // Fallback only: luminance of the first opaque background up the tree.
+    function effectiveBg() {
+      let n = document.body;
+      while (n && n !== document.documentElement) {
+        const c = getComputedStyle(n).backgroundColor;
+        if (c && !/(transparent)/.test(c) && !/,\s*0\s*\)$/.test(c)) return c;
+        n = n.parentElement;
+      }
+      return getComputedStyle(document.documentElement).backgroundColor || "rgb(255,255,255)";
+    }
+    function applyTheme() {
+      let light;
+      const hint = pageThemeHint();
+      if (hint) {
+        light = hint === "light";
+      } else {
+        const m = (effectiveBg().match(/\d+(?:\.\d+)?/g) || []).map(Number);
+        if (m.length < 3) return;
+        light = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2] > 140;
+      }
+      if (pageSettled) document.documentElement.classList.toggle("vs-light", light);
+    }
+
+    // Where the bar lives INSIDE the site's composer. We insert it as a real,
+    // in-flow DOM node (between the model tabs and the input on DeepSeek), so it
+    // takes the full composer width and never overlaps the site's own controls.
+    // The mount point is derived from each provider's composerFrame()+getEditor(),
+    // or a provider can override it via barMount(). Returns {parent, before}.
+    // The provider decides the exact mount (it knows which element is the input
+    // box and where a child reflows cleanly). If a provider doesn't supply one,
+    // we fall back to the floating bar rather than risk overlapping its layout.
+    // Thrash guard: inside-mounting our bar into a framework-reconciled composer
+    // (React/Vue) can start a fight - the framework moves/removes our node, the rAF
+    // loop re-inserts it, every single frame. That pegs the CPU and can crash the
+    // tab. If we detect a sustained re-insert storm, we permanently drop to anchored
+    // mode for this page (hug the composer WITHOUT inserting into its tree), which is
+    // safe on every site. Occasional re-inserts (a real SPA re-render) never trip it.
+    let _mountUnstable = false;
+    let _mountHits = [];
+    function computeBarMount() {
+      if (_mountUnstable) return null; // fell back to anchored after a thrash storm
+      if (!P.barMount) return null;
+      const m = P.barMount();
+      return (m && m.parent && m.parent.isConnected) ? m : null;
+    }
+
+    // Floating fallback geometry (used only when no inline mount is available).
+    const BAR_MAX_W = 560, BAR_GAP = 8;
+
+    // placeBar runs every frame. The DOM lookups it needs (composer, send button,
+    // login/captcha overlays) are the expensive part and rarely change, so keep each
+    // result for a moment instead of searching the page 60 times a second. A cached
+    // node that has left the page is looked up again right away.
+    const _lk = {};
+    const stillLive = (v) => !v || (v.nodeType ? v.isConnected : !v.parent || v.parent.isConnected);
+    function lookup(key, fn, ttl = 200) {
+      const c = _lk[key], now = performance.now();
+      if (c && now - c.t < ttl && stillLive(c.v)) return c.v;
+      const v = fn();
+      _lk[key] = { v, t: now };
+      return v;
+    }
+    // Style writes on every frame force the browser to redo layout; skip no-ops.
+    const setPx = (el, prop, n) => { const v = n + "px"; if (el.style[prop] !== v) el.style[prop] = v; };
+    const show = (el, d = "flex") => { if (el.style.display !== d) el.style.display = d; };
+
+    // Anchored mode bookkeeping: the composer element whose top padding we are
+    // borrowing to seat the bar (see the anchored branch below). Cleared when we
+    // leave anchored mode so the site's composer returns to its normal layout.
+    let anchorPadEl = null;
+    function clearAnchorPad() {
+      if (anchorPadEl) { try { anchorPadEl.style.paddingTop = ""; } catch {} anchorPadEl = null; }
+    }
+
+    // Position the floating "⚠ unstable" pill just above the bar's left edge.
+    function placeUnstable() {
+      const u = unstableEl;
+      if (!u) return;
+      if (!bar || bar.style.display === "none") { if (!u.hidden) u.hidden = true; return; }
+      const br = bar.getBoundingClientRect();
+      if (!br.width) { if (!u.hidden) u.hidden = true; return; }
+      if (u.hidden) u.hidden = false;
+      const uh = u.offsetHeight || 20;
+      u.style.left = Math.round(br.left) + "px";
+      u.style.top = Math.round(Math.max(4, br.top - uh - 5)) + "px";
+    }
+
+    function placeBar() {
+      barRaf = requestAnimationFrame(placeBar);
+      if (!bar || !pageSettled) return;
+
+      // Self-heal: a SPA navigation or a full re-render on the host (seen on Arena
+      // when the message frame jumps/teleports to the bottom) can detach our whole
+      // #vs-root from <html>, taking the bar with it - and nothing re-adds it, so
+      // the panel just vanishes. Re-append it whenever it's been detached; this
+      // rAF loop is resilient (its next frame is scheduled before any body code),
+      // so the panel reappears on the very next frame.
+      if (root && !root.isConnected) {
+        try { document.documentElement.appendChild(root); } catch {}
+      }
+
+      // The instability warning floats just ABOVE the bar (not inside it), so it
+      // never crowds the row on narrow composers like Gemini. Positioned from the
+      // bar's current rect every frame - works in all bar modes since it only
+      // reads where the bar ended up. One frame of lag is imperceptible.
+      placeUnstable();
+
+      // While a bot-check challenge OR a blocking modal (login / consent) is on
+      // screen, get fully out of the way: the (often transparent) anchored bar is
+      // a real full-width element over the composer's top edge and would silently
+      // intercept clicks on the challenge's / modal's buttons (e.g. "Continue with
+      // Google" at sign-in). Hide the bar and drop the reserved padding strip; it
+      // reappears on the next frame once the overlay clears.
+      if (lookup("blocked", () => (P.captchaPresent && P.captchaPresent()) || (P.overlayBlocking && P.overlayBlocking()))) {
+        show(bar, "none");
+        clearAnchorPad();
+        if (menuEl) menuEl.hidden = true;
+        return;
+      }
+
+      // Preferred: in-flow mount inside the composer (no overlap, full width).
+      const mount = lookup("mount", computeBarMount);
+      if (mount) {
+        clearAnchorPad();
+        // Re-insert ONLY when the bar has actually fallen OUT of the composer - never
+        // just because the framework reordered our node among its siblings. Fighting
+        // a reorder every frame is what pegs the CPU and crashes the tab; tolerating
+        // the position keeps the bar inside the composer without the fight.
+        if (bar.parentElement !== mount.parent) {
+          try { mount.parent.insertBefore(bar, mount.before || null); } catch {}
+          const now = Date.now();
+          _mountHits.push(now);
+          if (_mountHits.length > 40) _mountHits.shift();
+          // >24 real re-attaches inside 2s ⇒ the framework is fighting us: bail to
+          // anchored mode for good (safe everywhere) instead of risking a crash.
+          const recent = _mountHits.filter((t) => now - t < 2000).length;
+          if (recent > 24) {
+            _mountUnstable = true;
+            bar.classList.remove("vs-bar-inline", "vs-bar-inside");
+            diag("mount.thrash", { recent, provider: P.id });
+            return; // next frame uses the anchored branch below
+          }
+        }
+        if (!bar.classList.contains("vs-bar-inline")) {
+          bar.classList.add("vs-bar-inline");
+          bar.style.cssText = ""; // drop any leftover float positioning
+        }
+        // Transparent (blends in) when mounted INSIDE the input box; surface card
+        // when mounted ABOVE it. The provider's barMount() signals which via .inside.
+        bar.classList.toggle("vs-bar-inside", !!mount.inside);
+        show(bar);
+        if (menuEl && !menuEl.hidden) {
+          const br = bar.getBoundingClientRect();
+          menuEl.style.right = Math.round(window.innerWidth - br.right) + "px";
+          menuEl.style.bottom = Math.round(window.innerHeight - br.top + 6) + "px";
+          menuEl.style.maxHeight = Math.max(140, Math.round(br.top - 16)) + "px";
+        }
+        return;
+      }
+
+      // Anchored mode: the provider wants the integrated, in-composer LOOK but
+      // its composer is a framework-reconciled subtree we must NOT insert our
+      // node into (e.g. Kimi's Vue tree - inserting #vs-bar there makes Vue's
+      // next diff reuse the bar node as a host and nest the editor inside it).
+      // So we keep the bar in our own #vs-root, position it (position:fixed) to
+      // hug the composer's top edge at full width, and RESERVE that strip with
+      // padding-top on the composer so it reads as in-flow without ever becoming
+      // a child of the framework's DOM. barAnchor() returns the element to hug.
+      // Prefer the provider's dedicated anchor; if it can't resolve one, fall back
+      // to the composer frame so the bar STILL hugs the chat box (connected look)
+      // rather than dropping to the detached floating pill below. This keeps every
+      // site — even generic-factory ones with no barMount — fused to the composer.
+      const anchorEl = lookup("anchor", () => (P.barAnchor && P.barAnchor()) ||
+                       (P.composerFrame && P.composerFrame()) || null);
+      if (anchorEl && anchorEl.isConnected) {
+        bar.classList.remove("vs-bar-inline", "vs-bar-inside");
+        bar.classList.add("vs-bar-anchored");
+        if (root && bar.parentElement !== root) root.appendChild(bar);
+        const r = anchorEl.getBoundingClientRect();
+        if (!r.width) { show(bar, "none"); clearAnchorPad(); if (menuEl) menuEl.hidden = true; return; }
+        show(bar);
+        const bh = bar.offsetHeight || 34;
+        if (anchorPadEl && anchorPadEl !== anchorEl) clearAnchorPad();
+        anchorPadEl = anchorEl;
+        setPx(anchorEl, "paddingTop", bh + 6); // reserve the strip the bar sits in (+gap)
+        setPx(bar, "left", Math.round(r.left));
+        setPx(bar, "top", Math.round(r.top));
+        setPx(bar, "width", Math.round(r.width));
+        if (menuEl && !menuEl.hidden) {
+          bar.classList.remove("vs-bar-inline"); // ensure fixed geometry for menu math
+          menuEl.style.right = Math.round(window.innerWidth - (r.left + r.width)) + "px";
+          menuEl.style.bottom = Math.round(window.innerHeight - r.top + 6) + "px";
+          menuEl.style.maxHeight = Math.max(140, Math.round(r.top - 16)) + "px";
+        }
+        return;
+      }
+      bar.classList.remove("vs-bar-anchored");
+      clearAnchorPad();
+
+      // Fallback: float just above the editor (fixed positioning), for sites
+      // where no clean inline mount could be resolved.
+      if (bar.classList.contains("vs-bar-inline")) {
+        bar.classList.remove("vs-bar-inline");
+        if (root && bar.parentElement !== root) root.appendChild(bar);
+      }
+      const f = lookup("editor", () => (P.getEditor && P.getEditor()) || (P.composerFrame && P.composerFrame()));
+      if (!f) { show(bar, "none"); if (menuEl) menuEl.hidden = true; return; }
+      show(bar);
+      const r = f.getBoundingClientRect();
+      if (!r.width) { show(bar, "none"); return; }
+      const w = Math.min(r.width, BAR_MAX_W);
+      const left = Math.round(r.left + (r.width - w) / 2);
+      const bh = bar.offsetHeight || 40;
+      const top = Math.max(4, Math.round(r.top - bh - BAR_GAP));
+      setPx(bar, "width", w);
+      setPx(bar, "left", left);
+      setPx(bar, "top", top);
+      // Keep the open "more" menu anchored to the bar, opening upward.
+      if (menuEl && !menuEl.hidden) {
+        const br = bar.getBoundingClientRect();
+        menuEl.style.right = Math.round(window.innerWidth - br.right) + "px";
+        menuEl.style.bottom = Math.round(window.innerHeight - br.top + 6) + "px";
+        menuEl.style.maxHeight = Math.max(140, Math.round(br.top - 16)) + "px";
+      }
+    }
+
+    // Called by the core's sweep + after state changes: refresh the bar content.
+    // (Positioning runs continuously in placeBar; this only updates what's shown.)
+    function updateStartGate() { renderBar(); }
+
+    // Masks the input box while the extension types/sends, so the copied text
+    // and the submit aren't visible to the user.
+    // Returns a FULLY OPAQUE colour that matches what is VISUALLY behind the cover.
+    // The cover must hide the typed text, so it can't be translucent - but simply
+    // returning the first solid ancestor is wrong when the composer surface itself
+    // is translucent: Meta's card is rgba(56,56,56,0.8) over a dark page, so its
+    // real on-screen colour is a BLEND (~rgb(50,50,50)), lighter than the bare page
+    // (rgb(24,24,25)). Filling the cover with the page colour made it visibly
+    // darker than the composer. So collect the background layers from `el` up to
+    // the first opaque ancestor and FLATTEN them (alpha compositing) into one solid
+    // colour that reproduces the composer's actual appearance.
+    function opaqueBg(el) {
+      const layers = [];
+      let n = el;
+      while (n && n !== document.documentElement) {
+        const c = parseColor(getComputedStyle(n).backgroundColor);
+        if (c && c.a > 0) {
+          layers.push(c);
+          if (c.a >= 0.999) break; // opaque base reached - nothing behind matters
+        }
+        n = n.parentElement;
+      }
+      // Guarantee an opaque base at the bottom of the stack.
+      if (!layers.length || layers[layers.length - 1].a < 0.999) {
+        const base = parseColor(getComputedStyle(document.body).backgroundColor) ||
+                     { r: 255, g: 255, b: 255, a: 1 };
+        layers.push({ r: base.r, g: base.g, b: base.b, a: 1 });
+      }
+      // We collected top-most (el) first, so composite from the opaque base (last)
+      // upward toward el (first).
+      let out = layers[layers.length - 1];
+      for (let i = layers.length - 2; i >= 0; i--) out = blendOver(layers[i], out);
+      return `rgb(${Math.round(out.r)}, ${Math.round(out.g)}, ${Math.round(out.b)})`;
+    }
+    // Parse an rgb()/rgba() computed colour into {r,g,b,a}. Returns null for
+    // "transparent"/unparseable. getComputedStyle always yields rgb/rgba form.
+    function parseColor(c) {
+      if (!c || c === "transparent") return null;
+      const m = c.match(/rgba?\(([^)]+)\)/i);
+      if (!m) return null;
+      const p = m[1].split(",").map((x) => parseFloat(x));
+      return { r: p[0], g: p[1], b: p[2], a: p.length >= 4 ? p[3] : 1 };
+    }
+    // Source-over compositing of a (possibly translucent) fg onto an opaque bg.
+    function blendOver(fg, bg) {
+      const a = fg.a;
+      return {
+        r: fg.r * a + bg.r * (1 - a),
+        g: fg.g * a + bg.g * (1 - a),
+        b: fg.b * a + bg.b * (1 - a),
+        a: 1,
+      };
+    }
+
+    function inputCover(on) {
+      const ed = P.getEditor();
+      if (!on) {
+        if (cover) { cover.style.display = "none"; cover.dataset.on = ""; }
+        if (ed) ed.classList.remove("vs-typing");
+        cancelAnimationFrame(coverRaf);
+        return;
+      }
+      if (!ed) return;
+      ed.classList.add("vs-typing"); // make the typed text itself invisible
+      if (!cover) {
+        cover = document.createElement("div");
+        cover.id = "vs-input-cover";
+        cover.innerHTML = `<span>Agent is working…</span>`;
+        document.documentElement.appendChild(cover);
+      }
+      cover.dataset.on = "1"; // intent flag: keep the place() loop alive while set
+      cover.style.display = "flex";
+      const place = () => {
+        // Loop runs while the cover is INTENDED on (dataset.on), not while it's
+        // visible - so we can hide it for an overlay and still restore it after.
+        if (!cover || cover.dataset.on !== "1") return;
+        const e = P.getEditor();
+        if (!e) { coverRaf = requestAnimationFrame(place); return; }
+        // Re-assert the typing mask on the CURRENT editor node: sites that
+        // recreate the editor on each inject/clear (Kimi's Vue) drop the class,
+        // which would un-hide the raw text and un-cap its height. Cheap idempotent
+        // add every frame keeps the mask + height cap glued to the live node.
+        if (!e.classList.contains("vs-typing")) e.classList.add("vs-typing");
+        // The cover is SIZED to coverTarget() when a provider supplies one, else
+        // to the editor node itself. Some composers (Meta AI) make the editable a
+        // tiny line inside a much larger rounded card - covering only the editor
+        // left the rest of the card exposed and CLICKABLE (a careful click focused
+        // the editor and let the user type behind the cover). Meta returns its
+        // whole composer card so the cover blankets the entire input band and its
+        // pointer-events:auto blocks every click. The typing mask above still lives
+        // on the real editor node `e`.
+        const covNode = (P.coverTarget && P.coverTarget()) || e;
+        // While a blocking modal (login / consent) or bot-check is up, hide the
+        // cover so it doesn't sit on top of the modal; it reappears once the
+        // overlay clears (the loop keeps running).
+        if (
+          (P.overlayBlocking && P.overlayBlocking()) ||
+          (P.captchaPresent && P.captchaPresent())
+        ) {
+          cover.style.display = "none";
+          coverRaf = requestAnimationFrame(place);
+          return;
+        }
+        show(cover);
+        let r = covNode.getBoundingClientRect();
+        // Clip the cover to the composer's VISIBLE band. Some composers grow the
+        // inner editor node past a scrolling ancestor that clips it (Kimi's Vue
+        // RECREATES .chat-input-editor on every inject/clear, dropping the
+        // .vs-typing height cap, so the editor balloons to ~1500px while its
+        // .chat-input-editor-container caps the visible box via overflow:auto).
+        // Measuring the raw editor then centres the cover on the giant editor's
+        // midpoint - far below the visible input - so it "vanishes" off the box.
+        // Intersect with the nearest clipping ancestor to track what's on screen.
+        const clip = lookup("coverClip", () => {
+          for (let a = covNode.parentElement, i = 0; a && a !== document.body && i < 8; a = a.parentElement, i++) {
+            const ov = getComputedStyle(a).overflowY;
+            if (ov === "auto" || ov === "scroll" || ov === "hidden") return a;
+          }
+          return null;
+        }, 500);
+        if (clip) {
+          const ar = clip.getBoundingClientRect();
+          const top = Math.max(r.top, ar.top);
+          const bottom = Math.min(r.bottom, ar.bottom);
+          if (bottom > top) r = new DOMRect(r.left, top, r.width, bottom - top);
+        }
+        // Optionally overshoot the editor box by PAD px on every side. Some
+        // composers (Gemini's Quill) keep typed text near rounded corners, so a
+        // cover sized EXACTLY to the editor leaves slivers of text peeking; those
+        // providers set coverPad to bleed past the edges. A native <textarea>
+        // (DeepSeek) needs none - overshooting there just makes the cover overflow
+        // the composer, so it defaults to 0.
+        const PAD = P.coverPad || 0;
+        // Optional vertical nudge: some composers (Gemini's Quill) report an
+        // editor rect that sits a few px below the visual input box centre, so
+        // the centred "Agent is working…" text looks low. A provider can shift it.
+        const OFFY = P.coverOffsetY || 0;
+        // Height is at least MIN_H so the label is readable even over a
+        // single-line composer. CENTER the cover on the editor's vertical middle
+        // rather than anchoring its TOP to the editor top: a short (e.g. 20px)
+        // textarea bumped to 36px would otherwise grow only DOWNWARD, leaving the
+        // "Agent is working…" label sitting high in the composer's input band
+        // (seen on Cloudflare's 1-line textarea). For a composer already taller
+        // than MIN_H the maths reduces to the old `r.top - PAD`, so DeepSeek/Gemini
+        // are unchanged.
+        // Hard ceiling: even though .vs-typing caps the editor's visual height
+        // (see overlay.css), belt-and-suspenders clamp the cover so a composer
+        // whose growing element escapes that CSS cap on some provider can never
+        // turn the "Agent is working…" cover into a full-page white slab.
+        const MAXH = P.coverMaxH || 200;
+        const h = Math.min(Math.max(r.height + PAD * 2, 36), MAXH);
+        const centerY = r.top + r.height / 2 + OFFY;
+        setPx(cover, "left", r.left - PAD);
+        setPx(cover, "top", centerY - h / 2);
+        setPx(cover, "width", r.width + PAD * 2);
+        setPx(cover, "height", h);
+        // Composite the surface BEHIND the cover target so the fill matches what
+        // the user sees (a translucent composer card blends over the page).
+        const bg = lookup("coverBg", () => opaqueBg(covNode), 500);
+        if (cover.style.background !== bg) cover.style.background = bg;
+        // When the cover blankets a whole composer card (coverTarget), match its
+        // corner radius so the cover's square corners don't poke past the card's
+        // rounded ones. Editor-sized covers keep the CSS default.
+        if (P.coverTarget) cover.style.borderRadius = getComputedStyle(covNode).borderRadius;
+        coverRaf = requestAnimationFrame(place);
+      };
+      place();
+    }
+
+    // ── Create panels: model generator + UI builder ───────────────────────────
+    // The site's own AI designs it (core/modelkit.js, core/uikit.js); previews
+    // live in extension-page iframes so three.js and our preview styles stay
+    // out of the AI site. One panel per kind, built on first open.
+    const GEN = {
+      model: { kit: () => VSModel, page: "model.html", channel: "model", title: "Model generator", noun: "model",
+        hint: "Describe a model - a red phoenix, a bullet train…",
+        opts: `<select data-o="detail"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option></select>`,
+        prompt: (desc, o) => VSModel.buildPrompt(desc, o.detail || "medium"),
+        stats: (spec) => { const st = VSModel.stats(spec); return `${st.parts} parts · ${st.size.join(" × ")} studs`; },
+        done: (spec) => `${spec.name} is in Studio. Ctrl+Z undoes it.`, reset: true },
+      ui: { kit: () => VSUI, page: "ui-view.html", channel: "ui", title: "UI builder", noun: "UI",
+        hint: "Describe a GUI - a shop with 3 items, a main menu, a coins HUD…",
+        opts: `<select data-o="style"><option value="chunky" selected>Chunky</option><option value="clean">Clean</option><option value="dark">Dark</option><option value="cartoon">Cartoon</option></select>`,
+        prompt: (desc, o) => VSUI.buildPrompt(desc, o.style || "chunky"),
+        stats: (spec) => `${spec.elements.length} elements${spec.script.trim() ? " · with LocalScript" : ""}`,
+        done: (spec) => `${spec.name} is in StarterGui. Press Play to try it.`, reset: false },
+    };
+    const genPanels = {};
+    function openModels() { openGen("model"); }
+    function openGen(kind) {
+      for (const k in genPanels) if (k !== kind) genPanels[k].el.hidden = true;
+      if (kitPanel) kitPanel.hidden = true;
+      if (!genPanels[kind]) genPanels[kind] = buildGen(kind);
+      genPanels[kind].el.hidden = false;
+      genPanels[kind].el.querySelector(".vs-mg-desc").focus();
+    }
+    // Hand a prompt to the site's AI in this chat and read the reply back.
+    async function askSite(text) {
+      if (A.running || A.starting || A.injecting) throw new Error("Wait for the agent to finish (or stop it) first.");
+      A.stop = false;
+      const base = await submitAndGetBase(text);
+      const res = await waitForResponse(base);
+      if (res.kind === "text") return res.text;
+      throw new Error(res.kind === "stopped" ? "Stopped." : `${P.displayName} didn't answer. Try again.`);
+    }
+    function buildGen(kind) {
+      const G = GEN[kind], st = { spec: null, badge: "", revs: 0, busy: false, ready: false, opts: {} };
+      const el = document.createElement("div");
+      el.className = "vs-gen";
+      el.innerHTML = `
+        <div class="vs-mg-head"><b class="vs-mg-name">${G.title}</b><span class="vs-mg-badge" hidden></span>
+          <div class="vs-mg-tabs"><button data-t="script">Script</button><button data-t="preview" class="on">Preview</button></div>
+          <button class="vs-mg-x" title="Close">&times;</button></div>
+        <div class="vs-mg-new"><input class="vs-mg-desc" type="text" placeholder="${G.hint}" autocomplete="off" />${G.opts}
+          <button class="vs-mg-go vs-mg-primary">Generate</button></div>
+        <div class="vs-mg-tools"><button data-a="txt">Save .txt</button><button data-a="copy">Copy script</button>
+          <button data-a="insert" class="vs-mg-primary">Insert into Studio</button><span class="vs-mg-grow"></span>${G.reset ? '<button data-a="reset">Reset view</button>' : ""}</div>
+        <div class="vs-mg-stage"><iframe title="Preview"></iframe><pre class="vs-mg-script" hidden></pre>
+          <div class="vs-mg-empty">Your ${G.noun} shows up here. ${P.displayName} designs it - no API key needed.</div>
+          <div class="vs-mg-busy" hidden><span class="vs-spin"></span><span class="vs-mg-busy-t"></span></div>
+          <div class="vs-mg-stats" hidden></div></div>
+        <div class="vs-mg-rev"><input class="vs-mg-change" type="text" placeholder="Ask for a change…" autocomplete="off" /><button class="vs-mg-revise">Revise</button></div>`;
+      root.appendChild(el);
+      const q = (sel) => el.querySelector(sel);
+      const frame = q("iframe");
+      frame.src = chrome.runtime.getURL(G.page);
+      const post = (msg) => { if (st.ready) frame.contentWindow.postMessage({ vs: G.channel, ...msg }, "*"); };
+      window.addEventListener("message", (e) => {
+        if (e.source !== frame.contentWindow || !e.data || e.data.vs !== G.channel || e.data.type !== "ready") return;
+        st.ready = true;
+        if (st.spec) post({ type: "show", spec: st.spec });
+      });
+      const render = (busyText) => {
+        const has = !!st.spec;
+        q(".vs-mg-name").textContent = has ? st.spec.name : G.title;
+        q(".vs-mg-badge").hidden = !st.badge;
+        q(".vs-mg-badge").textContent = st.badge;
+        q(".vs-mg-empty").hidden = has || st.busy;
+        q(".vs-mg-busy").hidden = !st.busy;
+        if (busyText) q(".vs-mg-busy-t").textContent = busyText;
+        el.querySelectorAll(".vs-mg-tools button, .vs-mg-change, .vs-mg-revise").forEach((b) => { b.disabled = !has || st.busy; });
+        q(".vs-mg-go").disabled = st.busy;
+        q(".vs-mg-revise").textContent = st.revs ? `Revise · ${st.revs}` : "Revise";
+        q(".vs-mg-stats").hidden = !has;
+        if (has) { q(".vs-mg-stats").textContent = G.stats(st.spec); q(".vs-mg-script").textContent = G.kit().toLuau(st.spec); }
+      };
+      const show = (spec, badge) => { st.spec = spec; st.badge = badge; render(); post({ type: "show", spec }); };
+      const run = async (text, label, badge, after, read) => {
+        st.busy = true;
+        render(`${label}… ${P.displayName} is working on it`);
+        try {
+          const reply = await askSite(text);
+          const spec = read ? read(reply) : G.kit().parse(reply);
+          after();
+          show(spec, badge);
+          sfx("done");
+        } catch (e) { toast(String((e && e.message) || e)); sfx("error"); }
+        finally { st.busy = false; render(); }
+      };
+      el.querySelectorAll("select[data-o]").forEach((sel) => { st.opts[sel.dataset.o] = sel.value; sel.onchange = () => { st.opts[sel.dataset.o] = sel.value; }; });
+      const generate = () => {
+        const desc = q(".vs-mg-desc").value.trim();
+        if (!desc) return q(".vs-mg-desc").focus();
+        run(G.prompt(desc, st.opts), "Designing", "Generated", () => { st.revs = 0; });
+      };
+      const revise = () => {
+        const change = q(".vs-mg-change").value.trim();
+        if (!change || !st.spec) return;
+        // Models revise as remove/add (big models are too long to resend whole).
+        const read = kind === "model" ? (r) => VSModel.ground(VSModel.applyDelta(st.spec, VSModel.parseDelta(r))) : null;
+        run(G.kit().revisePrompt(st.spec, change), "Revising", "Revised", () => { st.revs++; q(".vs-mg-change").value = ""; }, read);
+      };
+      q(".vs-mg-x").onclick = () => { el.hidden = true; };
+      q(".vs-mg-go").onclick = generate;
+      q(".vs-mg-desc").addEventListener("keydown", (e) => { if (e.key === "Enter") generate(); });
+      q(".vs-mg-revise").onclick = revise;
+      q(".vs-mg-change").addEventListener("keydown", (e) => { if (e.key === "Enter") revise(); });
+      el.querySelectorAll(".vs-mg-tabs button").forEach((b) => b.addEventListener("click", () => {
+        el.querySelectorAll(".vs-mg-tabs button").forEach((x) => x.classList.toggle("on", x === b));
+        q(".vs-mg-script").hidden = b.dataset.t !== "script";
+      }));
+      q(".vs-mg-tools").addEventListener("click", async (e) => {
+        const b = e.target.closest("button[data-a]");
+        if (!b || !st.spec) return;
+        const code = G.kit().toLuau(st.spec);
+        if (b.dataset.a === "reset") post({ type: "reset" });
+        if (b.dataset.a === "copy") {
+          try { await navigator.clipboard.writeText(code); toast("Script copied - paste it into Studio's command bar."); } catch { toast("Could not copy."); }
+        }
+        if (b.dataset.a === "txt") {
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(new Blob([code], { type: "text/plain" }));
+          a.download = st.spec.name.replace(/[^\w -]/g, "").trim().replace(/\s+/g, "_") + ".txt";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+        }
+        if (b.dataset.a === "insert") {
+          b.disabled = true;
+          const out = await runTool({ tool: "execute_luau", arguments: { code, datamodel_type: "Edit" } });
+          if (/^ERROR/.test(out)) { toast("Studio couldn't build it: " + out.replace(/^ERROR:?\s*/, "").slice(0, 160)); sfx("error"); }
+          else { toast(G.done(st.spec)); sfx("done"); }
+          render();
+        }
+      });
+      render();
+      return { el };
+    }
+
+    // ── Toolkit panel: templates, script tools, health check ─────────────────
+    let kitPanel = null;
+    function openKit() {
+      for (const k in genPanels) genPanels[k].el.hidden = true;
+      if (!kitPanel) kitPanel = buildKit();
+      kitPanel.hidden = false;
+    }
+    // Templates and tools are build briefs for the running agent.
+    async function runBrief(item) {
+      if (!A.started) { toast("Press Start VoidScript first, then pick it again."); return; }
+      if (A.running || A.starting || A.injecting) { toast("The agent is busy - wait for it or press Stop."); return; }
+      kitPanel.hidden = true;
+      try { const base = await submitAndGetBase(`${item.name}: ${item.brief}`); await agentLoop(base); }
+      catch (e) { toast(String((e && e.message) || e)); }
+    }
+    function buildKit() {
+      const el = document.createElement("div");
+      el.className = "vs-gen vs-kit";
+      const cards = (list) => list.map((t) => `<button class="vs-kit-card" data-id="${t.id}"><span class="vs-kit-i">${t.icon}</span><b>${t.name}</b><span>${t.desc}</span></button>`).join("");
+      el.innerHTML = `
+        <div class="vs-mg-head"><b>Toolkit</b><div class="vs-mg-tabs"><button data-k="tpl" class="on">Templates</button><button data-k="tools">Script tools</button><button data-k="world">World</button><button data-k="assets">Assets</button><button data-k="console">Console</button><button data-k="changes">Changes</button><button data-k="snips">Snippets</button><button data-k="health">Health</button></div>
+          <button class="vs-mg-x" title="Close">&times;</button></div>
+        <div class="vs-kit-body" data-k="tpl"><div class="vs-kit-note">One click and the agent builds it in your open place.</div><div class="vs-kit-grid">${cards(VSKit.TEMPLATES)}</div></div>
+        <div class="vs-kit-body" data-k="tools" hidden><div class="vs-kit-note">Quick jobs on your current game.</div><div class="vs-kit-grid">${cards(VSKit.TOOLS)}</div></div>
+        <div class="vs-kit-body" data-k="world" hidden>
+          <div class="vs-kit-note">Lighting - one click sets the whole mood (Ctrl+Z in Studio undoes it).</div>
+          <div class="vs-kit-grid vs-kit-small">${VSKit.LIGHTING.map((p) => `<button class="vs-kit-card" data-l="${p.id}"><span class="vs-kit-i">${p.icon}</span><b>${p.name}</b><span>apply</span></button>`).join("")}</div>
+          <div class="vs-kit-note" style="margin-top:14px">Terrain - real smooth terrain from a seed, in seconds.</div>
+          <div class="vs-kit-grid vs-kit-small vs-ter">${VSKit.TERRAIN.map((p, i) => `<button class="vs-kit-card${i ? "" : " on"}" data-t="${p.id}"><span class="vs-kit-i">${p.icon}</span><b>${p.name}</b><span>preset</span></button>`).join("")}</div>
+          <div class="vs-kit-row"><select class="vs-ter-size"><option value="small">Small</option><option value="medium" selected>Medium</option><option value="large">Large</option></select>
+            <input class="vs-ter-seed" type="number" value="1" title="Seed" /><button class="vs-ter-dice" title="Random seed">🎲</button>
+            <label class="vs-kit-check"><input type="checkbox" class="vs-ter-replace" /> Replace existing</label>
+            <button class="vs-mg-primary vs-ter-go">Generate</button></div></div>
+        <div class="vs-kit-body" data-k="assets" hidden>
+          <div class="vs-kit-row"><input class="vs-as-q" type="text" placeholder="Search the free Creator Store - tree, sword, lava sound…" />
+            <select class="vs-as-type"><option>Model</option><option>Audio</option><option>MeshPart</option><option>Decal</option></select>
+            <button class="vs-mg-primary vs-as-go">Search</button></div><div class="vs-kit-list vs-as-out"></div></div>
+        <div class="vs-kit-body" data-k="console" hidden>
+          <textarea class="vs-lc-code" rows="7" spellcheck="false" placeholder='return #workspace:GetDescendants() .. " objects"'></textarea>
+          <div class="vs-kit-row"><select class="vs-lc-dm"><option>Edit</option><option>Server</option><option>Client</option></select>
+            <button class="vs-mg-primary vs-lc-run">Run (Ctrl+Enter)</button><span class="vs-mg-grow"></span><button class="vs-lc-play">▶ Play</button><button class="vs-lc-stop">■ Stop</button></div>
+          <pre class="vs-kit-pre vs-lc-out" hidden></pre></div>
+        <div class="vs-kit-body" data-k="changes" hidden><div class="vs-kit-note">Scripts the agent edited. Undo puts a script back to how it was before that edit.</div>
+          <div class="vs-kit-list vs-ch-out"></div><button class="vs-ch-all">Undo everything</button></div>
+        <div class="vs-kit-body" data-k="snips" hidden><div class="vs-kit-note">Your own prompts, one click to send to the agent.</div>
+          <div class="vs-kit-row"><input class="vs-sn-name" type="text" placeholder="Name" style="max-width:150px" /><input class="vs-sn-text" type="text" placeholder="Prompt - e.g. add a kill brick that respawns the player" />
+            <button class="vs-mg-primary vs-sn-add">Save</button></div><div class="vs-kit-list vs-sn-out"></div></div>
+        <div class="vs-kit-body" data-k="health" hidden><div class="vs-kit-note">Scans every script and part for free-model backdoors, loose parts, lag sources and outdated code. Read-only.</div>
+          <button class="vs-mg-primary vs-kit-run">Run health check</button><div class="vs-kit-out"></div></div>`;
+      root.appendChild(el);
+      el.querySelector(".vs-mg-x").onclick = () => { el.hidden = true; };
+      el.querySelectorAll(".vs-mg-tabs button").forEach((b) => b.addEventListener("click", () => {
+        el.querySelectorAll(".vs-mg-tabs button").forEach((x) => x.classList.toggle("on", x === b));
+        el.querySelectorAll(".vs-kit-body").forEach((x) => { x.hidden = x.dataset.k !== b.dataset.k; });
+      }));
+      el.addEventListener("click", (e) => {
+        const c = e.target.closest(".vs-kit-card");
+        if (c) runBrief(VSKit.TEMPLATES.concat(VSKit.TOOLS).find((t) => t.id === c.dataset.id));
+      });
+      const $k = (sel) => el.querySelector(sel);
+      const esc2 = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      const luau = async (code, okMsg) => {
+        const res = await runTool({ tool: "execute_luau", arguments: { code, datamodel_type: "Edit" } });
+        if (/^ERROR/.test(res)) { toast(res.replace(/^ERROR:?\s*/, "").slice(0, 180)); sfx("error"); return null; }
+        if (okMsg) { toast(okMsg); sfx("done"); }
+        return res;
+      };
+      // World: lighting + terrain
+      let terPreset = "island";
+      el.addEventListener("click", (e) => {
+        const l = e.target.closest("[data-l]");
+        if (l) luau(VSKit.lightingLuau(l.dataset.l), "Lighting set: " + VSKit.LIGHTING.find((p) => p.id === l.dataset.l).name + ".");
+        const t = e.target.closest("[data-t]");
+        if (t) { terPreset = t.dataset.t; el.querySelectorAll(".vs-ter .vs-kit-card").forEach((x) => x.classList.toggle("on", x === t)); }
+      });
+      $k(".vs-ter-dice").onclick = () => { $k(".vs-ter-seed").value = String(Math.floor(Math.random() * 99999) + 1); };
+      $k(".vs-ter-go").onclick = async () => {
+        const b = $k(".vs-ter-go");
+        b.disabled = true; b.textContent = "Generating…";
+        await luau(VSKit.terrainLuau(terPreset, $k(".vs-ter-size").value, Number($k(".vs-ter-seed").value) || 1, $k(".vs-ter-replace").checked), "Terrain generated. Ctrl+Z undoes it.");
+        b.disabled = false; b.textContent = "Generate";
+      };
+      // Assets: free Creator Store search + insert
+      const search = async () => {
+        const q = $k(".vs-as-q").value.trim();
+        if (!q) return;
+        const out = $k(".vs-as-out");
+        out.innerHTML = '<div class="vs-kit-note">Searching…</div>';
+        const res = await runTool({ tool: "search_asset", arguments: { query: q, assetType: $k(".vs-as-type").value, scope: "creator_store", priceFilter: "free", maxResults: 12 } });
+        if (/^ERROR/.test(res)) { out.innerHTML = `<div class="vs-kit-note">${esc2(res.slice(0, 200))}</div>`; return; }
+        const list = VSKit.parseAssets(res);
+        out.innerHTML = list.length ? list.map((a) => `<div class="vs-kit-item"><b>${esc2(a.name)}</b><span>${esc2([a.type, a.creator].filter(Boolean).join(" · "))}</span>
+          <button data-ins="${esc2(a.id)}" data-name="${esc2(a.name)}" data-type="${esc2(a.type)}">Insert</button></div>`).join("")
+          : `<pre class="vs-kit-pre">${esc2(res.slice(0, 1500))}</pre>`;
+      };
+      $k(".vs-as-go").onclick = search;
+      $k(".vs-as-q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+      $k(".vs-as-out").addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-ins]");
+        if (!b) return;
+        b.disabled = true; b.textContent = "Inserting…";
+        const args = { assetId: b.dataset.ins, assetName: b.dataset.name };
+        if (b.dataset.type) args.assetType = b.dataset.type;
+        const res = await runTool({ tool: "insert_asset", arguments: args });
+        if (/^ERROR/.test(res)) { toast(res.slice(0, 180)); b.disabled = false; b.textContent = "Insert"; }
+        else { toast(`${b.dataset.name} is in Studio.`); sfx("done"); b.textContent = "Inserted ✓"; }
+      });
+      // Console: run Luau, Play / Stop
+      const runLc = async () => {
+        const code = $k(".vs-lc-code").value.trim();
+        if (!code) return;
+        const out = $k(".vs-lc-out");
+        out.hidden = false; out.textContent = "Running…";
+        const res = await runTool({ tool: "execute_luau", arguments: { code, datamodel_type: $k(".vs-lc-dm").value } });
+        out.classList.toggle("vs-err", /^ERROR/.test(res));
+        out.textContent = res.replace(/^Output of '[^']*':\n?/, "") || "(done - no output; use return to see a value)";
+      };
+      $k(".vs-lc-run").onclick = runLc;
+      $k(".vs-lc-code").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runLc(); } e.stopPropagation(); });
+      $k(".vs-lc-play").onclick = async () => toast(/^ERROR/.test(await runTool({ tool: "start_stop_play", arguments: { is_start: true } })) ? "Couldn't start Play." : "Playing in Studio.");
+      $k(".vs-lc-stop").onclick = async () => toast(/^ERROR/.test(await runTool({ tool: "start_stop_play", arguments: { is_start: false } })) ? "Couldn't stop." : "Stopped.");
+      // Changes: the session's script edits, newest first, each undoable
+      const renderChanges = () => {
+        const rows = _undoStack.map((u, i) => ({ u, i })).reverse();
+        $k(".vs-ch-out").innerHTML = rows.length ? rows.map(({ u, i }) => `<div class="vs-kit-item"><b>${esc2(u.path.replace(/^game\./, ""))}</b>
+          <span>${new Date(u.t).toLocaleTimeString()}</span><button data-undo="${i}">Undo</button></div>`).join("") : '<div class="vs-kit-note">No script edits yet.</div>';
+        $k(".vs-ch-all").hidden = !rows.length;
+      };
+      $k(".vs-ch-out").addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-undo]");
+        if (!b) return;
+        const i = Number(b.dataset.undo), entry = _undoStack[i];
+        b.disabled = true; b.textContent = "Undoing…";
+        const res = await revertEntry(entry);
+        if (res !== "OK") { toast(res.slice(0, 180)); b.disabled = false; b.textContent = "Undo"; return; }
+        // That edit and any later ones to the same script are now gone.
+        for (let k = _undoStack.length - 1; k >= i; k--) if (_undoStack[k].path === entry.path) _undoStack.splice(k, 1);
+        persistUndoStack();
+        toast("Undone."); renderChanges();
+      });
+      $k(".vs-ch-all").onclick = async () => {
+        while (_undoStack.length) {
+          const res = await revertEntry(_undoStack[_undoStack.length - 1]);
+          if (res !== "OK") { toast(res.slice(0, 180)); break; }
+          _undoStack.pop();
+        }
+        persistUndoStack(); renderChanges();
+      };
+      // Snippets: saved prompts
+      let snips = [];
+      const renderSnips = () => {
+        $k(".vs-sn-out").innerHTML = snips.length ? snips.map((sn, i) => `<div class="vs-kit-item"><b>${esc2(sn.name)}</b><span>${esc2(sn.text.slice(0, 90))}</span>
+          <button data-send="${i}">Send</button><button data-del="${i}" title="Delete">×</button></div>`).join("") : '<div class="vs-kit-note">No snippets yet.</div>';
+      };
+      try { chrome.storage.local.get("vsSnippets", (r) => { snips = (r && Array.isArray(r.vsSnippets)) ? r.vsSnippets : []; renderSnips(); }); } catch {}
+      const saveSnips = () => { try { chrome.storage.local.set({ vsSnippets: snips }); } catch {} renderSnips(); };
+      $k(".vs-sn-add").onclick = () => {
+        const text = $k(".vs-sn-text").value.trim();
+        if (!text) return;
+        snips.push({ name: $k(".vs-sn-name").value.trim() || text.slice(0, 24), text });
+        $k(".vs-sn-name").value = $k(".vs-sn-text").value = "";
+        saveSnips();
+      };
+      $k(".vs-sn-out").addEventListener("click", (e) => {
+        const send = e.target.closest("[data-send]"), del = e.target.closest("[data-del]");
+        if (send) { const sn = snips[Number(send.dataset.send)]; runBrief({ name: sn.name, brief: sn.text }); }
+        if (del) { snips.splice(Number(del.dataset.del), 1); saveSnips(); }
+      });
+      // Keep typing inside the panel from reaching the AI site's shortcuts.
+      el.addEventListener("keydown", (e) => e.stopPropagation());
+      el.querySelectorAll(".vs-mg-tabs button").forEach((b) => b.addEventListener("click", () => { if (b.dataset.k === "changes") renderChanges(); }));
+
+      const runBtn = el.querySelector(".vs-kit-run"), out = el.querySelector(".vs-kit-out");
+      runBtn.onclick = async () => {
+        runBtn.disabled = true; runBtn.textContent = "Scanning…";
+        try {
+          const res = await runTool({ tool: "execute_luau", arguments: { code: VSKit.HEALTH_LUAU, datamodel_type: "Edit" } });
+          if (/^ERROR/.test(res)) throw new Error(res.replace(/^ERROR:?\s*/, "").slice(0, 200));
+          const h = VSKit.report(res), r = h.raw;
+          const e = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+          out.innerHTML = `<div class="vs-hc-top"><span class="vs-hc-grade vs-g-${h.grade}">${h.grade}</span><div><b>${h.score}/100</b>
+            <span>${r.parts.toLocaleString()} parts · ${r.scripts + r.localScripts + r.modules} scripts</span></div></div>` +
+            (h.issues.length ? h.issues.map((i) => `<div class="vs-hc-i vs-s-${i.sev}"><b>${e(i.title)}</b><span>${e(i.text)}</span></div>`).join("") +
+              `<button class="vs-mg-primary vs-kit-fix">Fix with the agent</button>` : "<div class=\"vs-kit-note\">No problems found. Nice.</div>");
+          const fix = out.querySelector(".vs-kit-fix");
+          if (fix) fix.onclick = () => runBrief({ name: "Health check fixes", brief: VSKit.fixPrompt(h) });
+        } catch (err) { toast("Health check failed: " + String((err && err.message) || err)); }
+        finally { runBtn.disabled = false; runBtn.textContent = "Run health check"; }
+      };
+      return el;
+    }
+
+    // Shortcuts: Alt+Shift+T toolkit, +G models, +U UI builder.
+    document.addEventListener("keydown", (e) => {
+      if (!e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "t") { e.preventDefault(); openKit(); }
+      else if (k === "g") { e.preventDefault(); openGen("model"); }
+      else if (k === "u") { e.preventDefault(); openGen("ui"); }
+    }, true);
+
+    function toast(msg) {
+      const t = document.createElement("div");
+      t.className = "vs-toast";
+      t.textContent = msg;
+      root.appendChild(t);
+      setTimeout(() => t.classList.add("show"), 10);
+      setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, 3500);
+    }
+
+    function banner(kind, title, msg) {
+      if (kind !== "ok") sfx("error");
+      const b = document.createElement("div");
+      b.className = `vs-banner ${kind}`;
+      b.innerHTML = `<div class="vs-banner-t"></div><div class="vs-banner-m"></div>
+        <div class="vs-banner-acts">
+          <button class="vs-banner-x">Close</button>
+        </div>`;
+      b.querySelector(".vs-banner-t").textContent = title;
+      b.querySelector(".vs-banner-m").textContent = msg;
+      b.querySelector(".vs-banner-x").addEventListener("click", () => b.remove());
+      root.appendChild(b);
+    }
+
+    // Left-hand VoidScript popup showing the latest screen_capture. Fed from the
+    // in-memory base64 (a data: URL always renders), so it works identically on
+    // every provider and never touches the site's DOM. Only the most recent
+    // capture is kept - a new one replaces the old.
+    function showImages(images, toolName) {
+      root.querySelectorAll(".vs-shot").forEach((e) => e.remove());
+      const wrap = document.createElement("div");
+      wrap.className = "vs-shot";
+      const hdr = document.createElement("div");
+      hdr.className = "vs-shot-hdr";
+      const ttl = document.createElement("span");
+      ttl.className = "vs-shot-ttl";
+      ttl.textContent = `${toolName} · ${images.length} image${images.length > 1 ? "s" : ""}`;
+      const close = document.createElement("button");
+      close.className = "vs-shot-x";
+      close.textContent = "✕";
+      close.addEventListener("click", () => wrap.remove());
+      hdr.appendChild(ttl);
+      hdr.appendChild(close);
+      wrap.appendChild(hdr);
+      const body = document.createElement("div");
+      body.className = "vs-shot-body";
+      for (const img of images) {
+        const el = document.createElement("img");
+        el.className = "vs-shot-img";
+        el.src = `data:${img.mimeType || "image/jpeg"};base64,${img.data}`;
+        body.appendChild(el);
+      }
+      wrap.appendChild(body);
+      root.appendChild(wrap);
+    }
+
+    build();
+    return { openModels, setStatus, setStarted, setStarting, showStop, markStopping, inputCover, toast, banner, showImages, nudgeStart, updateStartGate, refreshSetup, getCustomPrompt, setCustomPrompt, getProjectType, setProjectType, getCustomMcpServers, takeWizardPrompt, setWizardPrompt, takeCompactionHandoff, openMenu: (toSupport) => openMenuFn && openMenuFn(toSupport) };
+  })();
+
+  // ── Live token + timer, shown ONLY on a tool call's chip detail. The
+  //    elapsed-time ANCHOR is stored on the chip's DOM node (dataset) so the
+  //    timer survives re-renders / conversation switches. ────────────────────
+  const TOKEN_CHARS = 4;
+  // ── Token estimate (Feature) ────────────────────────────────────────────
+  // Rough session cost tracker: counts characters round-tripped through the
+  // model (our messages + tool results) at ~4 chars/token. Not a true tokenizer,
+  // but a useful "roughly how much did this session use" meter in the bar plus a
+  // cumulative per-provider lifetime total kept in chrome.storage.local.
+  const TOKEN_EST = { prompt: 0, tool: 0 };
+  function countTokensEst(text) {
+    return Math.max(1, Math.floor(String(text || "").length / TOKEN_CHARS));
+  }
+  function noteTokens(type, text) {
+    TOKEN_EST[type] = (TOKEN_EST[type] || 0) + countTokensEst(text);
+  }
+  function sessionTokenEst() {
+    return (TOKEN_EST.prompt || 0) + (TOKEN_EST.tool || 0);
+  }
+  function formatTokens(n) {
+    if (!n) return "0 tok";
+    return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M tok` : n >= 1000 ? `${(n / 1000).toFixed(1)}k tok` : `${n} tok`;
+  }
+  // Accumulate the session's estimate into a per-provider lifetime total kept in
+  // chrome.storage.local (key "vsTokenTotals"). Written at session end so the
+  // user can see long-run usage by provider without a server.
+  function persistTokenTotals(added) {
+    if (!added || !chrome?.storage?.local) return;
+    try {
+      chrome.storage.local.get({ vsTokenTotals: {} }, (st) => {
+        const totals = st.vsTokenTotals || {};
+        const id = P.id || "unknown";
+        totals[id] = (totals[id] || 0) + added;
+        chrome.storage.local.set({ vsTokenTotals: totals }).catch(() => {});
+      });
+    } catch {}
+  }
+
+  // 0-999 as-is; 1000+ compacted to 1k/1.1k/99k/1M... (one decimal below 10 of
+  // the unit, none at/above it, trailing ".0" dropped) so a live token count
+  // doesn't grow into a wide, jumpy number as the reply streams in.
+  function formatCount(n) {
+    if (n < 1000) return String(n);
+    const units = [[1e9, "B"], [1e6, "M"], [1e3, "k"]];
+    for (const [div, suf] of units) {
+      if (n >= div) {
+        const v = n / div;
+        const rounded = v < 10 ? Math.round(v * 10) / 10 : Math.round(v);
+        return rounded + suf;
+      }
+    }
+    return String(n);
+  }
+
+  function setChipDetail(item, text) {
+    const dt = item && item.querySelector(".vs-chip .vs-chip-dt");
+    if (dt) dt.textContent = text;
+  }
+
+  // Update ONLY the chip's label text (no innerHTML rebuild), so live-correcting
+  // the name mid-stream doesn't restart the spinner or wipe the token meter.
+  function setChipLabel(item, text) {
+    const tx = item && item.querySelector(".vs-chip .vs-chip-tx");
+    if (tx && tx.textContent !== text) tx.textContent = text;
+  }
+
+  // Elapsed seconds since a per-item anchor (persisted on the node).
+  function elapsedOn(item, key, fallbackStart) {
+    if (!item) return 0;
+    let t0 = Number(item.dataset[key] || 0);
+    if (!t0) { t0 = fallbackStart || Date.now(); item.dataset[key] = String(t0); }
+    return (Date.now() - t0) / 1000;
+  }
+
+  // Timestamp of the user's last REAL click on the site (trusted event, outside
+  // VoidScript's own UI). A genuine "regenerate ↻" is always such a click;
+  // DeepSeek's post-stop phantom generations and stop-button re-mount flickers
+  // never are - this is what tells them apart (seen live: two false regenResume
+  // fired 8s/2s after a Stop with no user action, un-stopping the halted turn).
+  let _userClickAt = 0;
+  document.addEventListener("click", (e) => {
+    if (e.isTrusted && !(e.target && e.target.closest && e.target.closest("#vs-root"))) {
+      _userClickAt = Date.now();
+    }
+  }, true);
+
+  let _prevHardGen = null, _prevSoftGen = null;
+  setInterval(() => {
+    const gen = P.isGenerating(); // growth-tolerant: used for the live token meter
+    // Watchdog freshness clock. Growth-tolerant (not just the hard stop-button
+    // signal): a SHORT command after a long reasoning phase shows its stop
+    // square for only a frame or two - too briefly for this 200ms sampler.
+    if (gen) { A.lastGenAt = Date.now(); persistLoopResume(); }
+    // High-water mark of the newest turn id seen this session (virtualization-
+    // safe). The auto-resume watchdog uses it to IGNORE a scrolled-back OLD turn:
+    // on a virtualized list lastAssistant() is the last RENDERED turn, which when
+    // scrolled up is old, and its injected-result row is off-screen/unrendered so
+    // the "result below" guard can't see it. A numeric provider id (DeepSeek's
+    // data-virtual-list-item-key) is monotonic per turn, so the max only grows at
+    // the live bottom and a scrolled-back turn reads strictly below it.
+    if (P.itemKey && P.lastAssistantId) {
+      const nk = Number(P.lastAssistantId());
+      if (Number.isFinite(nk) && (A.maxTurnId == null || nk > A.maxTurnId)) A.maxTurnId = nk;
+    }
+    // Slide the regenerate grace anchor while generation is still (intermittently)
+    // active, so the chip stays "run" across gen-false blips right up to the moment
+    // the watchdog re-owns the tool (see regenResume).
+    if (A.resumeArmed && gen) A.resumeArmedAt = Date.now();
+    const hardGen = A.started && P.isHardGenerating();
+
+    // Regenerate-as-resume: after a manual stop (A.userStopped) the agent stays
+    // dormant until fresh user intent. Typing a message or the native Continue
+    // clears the latch, but clicking the site's "regenerate ↻" does not - and on
+    // Qwen that control is unlabeled and indistinguishable from copy/like, so we
+    // can't hook the button reliably. Detect the EFFECT instead: a brand-new
+    // generation (gen false→true) while we are stopped and otherwise idle can only
+    // come from a user action (there is no spontaneous generation). Treat it as
+    // resume - clear the stop latch and drop the turn's stopped/no-resume markers
+    // so the auto-resume watchdog can pick the regenerated reply's tool back up.
+    // Providers with NO native "regenerate" control (e.g. ReidChat) can opt out
+    // via hasRegenerate:false - for them a gen false→true blip while stopped is
+    // only abort/caret churn, never a real regenerate, so honouring it would
+    // spuriously clear the manual-stop latch and auto-resume against the user.
+    // HARD edge only: the growth-tolerant `gen` blips false→true when the site
+    // re-renders the HALTED turn after a stop (adding its "Stopped" marker grows
+    // streamText, which counts as growth for 800ms) - that blip falsely cleared
+    // the latch, repainted the stopped chip ✓ green and re-armed auto-resume. A
+    // real regenerate always raises the site's stop control, so require it; on
+    // DeepSeek (no stop control during reasoning) this merely delays the resume
+    // to the answer phase, after which the watchdog acts anyway.
+    // Tracker: a soft (growth-only) blip in the stopped-idle state - exactly the
+    // false trigger the hard-edge gate above filters out. Log it so live tests
+    // can SEE the old bug firing and being ignored.
+    if (A.started && A.userStopped && !A.running && !A.injecting && !A.stopping &&
+        gen && _prevSoftGen === false && !hardGen) {
+      diag("regenBlip.ignored");
+    }
+    if (P.hasRegenerate !== false &&
+        A.started && A.userStopped && !A.running && !A.injecting && !A.stopping &&
+        hardGen && _prevHardGen === false) {
+      // Gate on ACTUAL user intent: a real regenerate is always a trusted click
+      // moments before the new generation, and never the Stop click itself.
+      // Distinguish the two by ORDER, not a fixed delay: require the latest
+      // trusted click to fall clearly AFTER the Stop (clickAfterStop). A native
+      // stop click lands ~at A.stopAt, so it fails this and can't self-resume;
+      // the extension's own "■ Stop" is inside #vs-root and never updates
+      // _userClickAt at all, so only the later regenerate qualifies. This
+      // replaces the old absolute `stopAge > 3000` grace, which also blocked a
+      // user who regenerated quickly (~1.5s) after Stop - the real bug seen live.
+      // DeepSeek's post-stop phantom generations carry no fresh trusted click,
+      // so they still fail the gate.
+      const clickAge = Date.now() - _userClickAt;
+      const stopAge = Date.now() - (A.stopAt || 0);
+      const clickAfterStop = _userClickAt - (A.stopAt || 0);
+      if (clickAge < 2500 && clickAfterStop > 400) {
+        A.userStopped = false;
+        const it = P.lastAssistant();
+        if (it) {
+          delete it.dataset.zStopped; delete it.dataset.zResume;
+          delete it.dataset.zResumeLen; delete it.dataset.zloop;
+          forgetHalted(it);
+          // Strip the OLD command's chip immediately. The regenerate reuses this
+          // turn node, and without this the previous execute_luau chip (with its
+          // spinner/settled state) lingers for ~200ms until the sweep repaints the
+          // node - the visible "it keeps running the old call for a beat before
+          // restarting" flash reported on Kimi. resetDecoration clears the chip and
+          // every marker so the regenerated reply classifies fresh.
+          resetDecoration(it);
+          // Kimi (and other node-reusing sites) leave the OLD command text in the
+          // reply DOM for ~2s after regenerate starts, before wiping it and
+          // streaming the new reply. resetDecoration only removes OUR chip - the
+          // sweep then re-derives a fresh "run" chip from that stale old command
+          // (old token count and all) until the content is replaced: the "red
+          // stopped chip turns into a grey spinner on the OLD call" flash reported
+          // live. Capture the old text length so the sweep can tell the DOM still
+          // holds the stale command and keep the coherent red "stopped" look until
+          // Kimi actually replaces it (see the zRegenLen guard in classify).
+          try {
+            it.dataset.zRegenLen = String(P.classifyText(it, ".vs-chip").length);
+            it.dataset.zRegenAt = String(Date.now());
+          } catch {}
+        }
+        // Bridge the gap until the auto-resume watchdog (1s interval) re-owns the
+        // tool: regenResume only CLEARS the stop latch, it does not start the loop
+        // (the regenerated command hasn't finished streaming yet, so there's
+        // nothing to dispatch). In that ~1s window A.running is still false and
+        // Gemini's generation signal blips false between reasoning and command
+        // settle, so the sweep painted the chip a premature ✓ "done" before the
+        // real execution began. Arm a grace anchor the sweep honours as "live"; it
+        // slides while generation blips (refreshed in the meter loop) and expires
+        // shortly after generation truly stops, by which point the watchdog has
+        // taken over (A.running) or the reply was plain text with no tool.
+        A.resumeArmed = true;
+        A.resumeArmedAt = Date.now();
+        diag("regenResume", { clickAge, stopAge, clickAfterStop });
+      } else {
+        diag("regenEdge.ignored", { clickAge, stopAge, clickAfterStop });
+      }
+    }
+    _prevHardGen = hardGen;
+    _prevSoftGen = gen;
+    // Our "■ Stop" button stays visible for the WHOLE active turn (generation,
+    // reasoning, or a tool/wait running on the bridge). It is complete on its own
+    // - stopLoop both halts our loop AND clicks the site's native stop - and the
+    // site's native stop likewise halts our loop via onNativeStop, so either one
+    // fully stops everything. Two stop buttons at once is fine.
+    // The bare isHardGenerating() term is gated on a live VoidScript session: on
+    // a plain chat with no session, a user's own message makes the site generate,
+    // and we must NOT briefly flash our Stop button over that.
+    // Self-heal a stuck "Stopping…": if we flagged stopping but nothing is
+    // actually busy anymore (the loop's finally never ran because the Stop landed
+    // before a loop started, or a pending start was cancelled), release it so the
+    // button doesn't freeze on "Stopping…". While the site is STILL streaming,
+    // re-click its native stop (throttled) instead of releasing: the first click
+    // sometimes gets swallowed by a re-render, and handing back a clickable
+    // "■ Stop" the user has to press again is exactly the bounce we're killing.
+    if (A.stopping && !A.running && !A.toolRunning) {
+      if (Date.now() - (A.stopAt || 0) > 4000) {
+        // Our loop is already down. If the site keeps generating past this, that's
+        // the site's own reply - its native stop handles it. Never hold the user on
+        // a disabled "Stopping…" waiting for an AI that won't stop.
+        A.stopping = false;
+        diag("stop.released", { gen: P.isHardGenerating() });
+      } else if (A.started && P.isHardGenerating()) {
+        // CRITICAL: only re-click the native stop if the reply has ACTUALLY kept
+        // growing since the last stop click. On Gemini (and GLM) the stop button
+        // WEDGES visible for up to ~10s after a successful stop, so the old
+        // unconditional retry clicked a stop with NO live stream behind it -
+        // and Gemini queues that stray abort against the conversation, then
+        // KILLS THE NEXT reply the instant it starts ("Vous avez interrompu
+        // cette réponse" on a message the user never stopped - validated live,
+        // 2026-07: two stray stop.retry clicks after a VS Stop made the next
+        // two user turns die instantly; with no stray clicks the same flow
+        // worked). A swallowed first click - the case this retry exists for -
+        // always shows up as the stream STILL writing, i.e. growth past the
+        // baseline captured at stop time (A.stopStreamLen, set in stopLoop /
+        // onNativeStop and re-based after each retry so every retry needs
+        // fresh growth of its own).
+        const grown = (P.streamLen ? P.streamLen() : 0) > (A.stopStreamLen || 0) + 24;
+        if (grown && Date.now() - (A.stopRetryAt || 0) > 800) {
+          A.stopRetryAt = Date.now();
+          A.stopStreamLen = P.streamLen ? P.streamLen() : 0;
+          try { P.stopGeneration(); } catch {}
+          diag("stop.retry");
+        } else if (!grown && Date.now() - (A.stopAt || 0) > 2500) {
+          // Wedged stop button on a dead stream (text frozen since the stop):
+          // the site is effectively quiet - release "Stopping…" instead of
+          // holding it for the whole wedge window.
+          A.stopping = false;
+          diag("stop.quiet", { wedged: true });
+        }
+      } else {
+        A.stopping = false;
+        diag("stop.quiet"); // drain over: site quiet, Stopping… released
+      }
+    }
+    ui.showStop(A.running || A.toolRunning || A.stopping || (A.started && P.isHardGenerating()));
+
+    // Tool is executing on the MCP → timer on its chip.
+    if (A.toolRunning && A.toolItem) {
+      const s = elapsedOn(A.toolItem, "vsToolT0", A.toolStart).toFixed(1);
+      setChipDetail(A.toolItem, (A.toolArg ? A.toolArg + " · " : "") + `${s}s`);
+      return;
+    }
+    // The site is streaming a tool call → token count + timer on its chip.
+    if (gen) {
+      const item = P.lastAssistant();
+      const reply = item ? P.itemText(item) : ""; // non-thinking only
+      const zphase = item && item.dataset.zphase;
+      // Skip items already settled (done/err) - don't overwrite the finished chip.
+      if (item && zphase !== "done" && zphase !== "err" && VSParse.hasToolSignature(reply)) {
+        // Live-correct the label as soon as the real name streams in.
+        const name = VSParse.toolNameFromText(reply);
+        if (name && name !== "command") setChipLabel(item, name);
+        const tokens = Math.floor(reply.length / TOKEN_CHARS);
+        const s = Math.round(elapsedOn(item, "vsGenT0"));
+        setChipDetail(item, `~${formatCount(tokens)} tokens · ${s}s`);
+        return;
+      }
+    }
+    // Live session timer in the bar: shows elapsed + tool tally while a loop is
+    // running, hidden the rest of the time. Rendered every 200ms alongside the
+    // chip timers above (cheap: two textContent writes, no DOM churn).
+    if (liveEl) {
+      if (A.running && A.startedAt) {
+        liveEl.hidden = false;
+         const tally = (A.runOk || 0) + (A.runErr || 0);
+         const showTokens = vsOn("vsShowTokenEstimate") && sessionTokenEst() > 0;
+         const label = tally
+           ? `· ${fmtDur((Date.now() - A.startedAt) / 1000)} · ${tally} cmd${tally === 1 ? "" : "s"}` +
+             (showTokens ? ` · ~${formatTokens(sessionTokenEst())}` : "")
+           : `· ${fmtDur((Date.now() - A.startedAt) / 1000)}`;
+        if (liveEl.textContent !== label) liveEl.textContent = label;
+      } else if (!liveEl.hidden) {
+        liveEl.hidden = true;
+      }
+    }
+  }, 200);
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  WIRING
+  // ════════════════════════════════════════════════════════════════════════
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "vs-status") {
+      ui.setStatus({ connected: msg.connected, mcpAlive: msg.mcpAlive, studio: msg.studio, studioApp: msg.studioApp, studioProc: msg.studioProc, tools: msg.tools, servers: msg.servers });
+    }
+    if (msg && msg.type === "vs-open-menu") {
+      ui.openMenu(false); // from the popup's Settings button — opens at the top (Switch AI / custom prompt)
+    }
+  });
+
+  bg({ type: "status" }).then((s) => s && ui.setStatus(s));
+  setInterval(() => bg({ type: "status" }).then((s) => s && ui.setStatus(s)), 5000);
+
+  // Session state is derived from the ACTUAL chat, but sites VIRTUALIZE their
+  // message lists: the system-prompt turn is dropped from the DOM once it
+  // scrolls out of the window. So we key "started" by conversation
+  // (P.conversationKey()): once we have seen the marker for a key, we remember
+  // it (persisted so it survives reloads). We never flip while busy.
+  const startedSessions = new Set();
+  let lastSyncPath = null;
+  function rememberSession(path) {
+    // A falsy key = a TRANSIENT conversation URL (e.g. Gemini's /app before an
+    // id is assigned). Remembering it would mark every future fresh chat as
+    // "already started" and kill the Start gate. The real key is remembered by
+    // the next sync once the site assigns the conversation its id.
+    if (!path) return;
+    if (startedSessions.has(path)) return;
+    startedSessions.add(path);
+    try { chrome.storage.local.set({ vsStartedSessions: [...startedSessions].slice(-300) }); } catch {}
+  }
+  // Load the persisted set once, then re-sync.
+  try {
+    chrome.storage.local.get("vsStartedSessions", (r) => {
+      if (r && Array.isArray(r.vsStartedSessions)) {
+        for (const p of r.vsStartedSessions) startedSessions.add(p);
+  // Session resume: a page refresh mid-build wipes the in-memory freshness
+  // clock, so restore it from the persisted liveness record when the SAME
+  // conversation is open and the record is fresh (< 120s). The auto-resume
+  // watchdog then re-owns the interrupted command turn on its own. Only the
+  // freshness clock is restored - every other guard (turned stopped, result
+  // already below, conversation changed) still applies and blocks a false resume.
+  try {
+    chrome.storage.local.get("vsLoopResume", (r) => {
+      const rec = r && r.vsLoopResume;
+      if (rec && rec.conv && rec.conv === P.conversationKey()) {
+        const age = Date.now() - (rec.t || 0);
+        if (age < 120000 && A.lastGenAt === 0) {
+          A.lastGenAt = rec.lastGenAt || Date.now();
+          diag("resume.restored", { conv: rec.conv, ageMs: age });
+        } else {
+          clearLoopResume(); // stale (or wrong conversation) → drop it
+        }
+      }
+    });
+  } catch {}
+  syncSessionState();
+  // A shared build-recipe link (?vsRecipe=…) re-applies prompt + genre + addons
+  // and auto-starts, so one URL replays a full build setup on any supported AI.
+  applyRecipe(location.href);
+      }
+    });
+  } catch {}
+  // A conversation IS a VoidScript session if any rendered turn carries a
+  // telltale artefact: the system-prompt marker, an injected tool-result /
+  // system-note turn, or a VoidScript command an assistant wrote. Works even
+  // after a full cold start and regardless of scroll position.
+  function domHasVsSignal() {
+    for (const it of P.allItems()) {
+      const txt = it.textContent || "";
+      if (txt.includes(VS.SYS_MARKER)) return true;
+      if (/(^|\n)\s*Output of '[^']+':/.test(txt) || txt.includes("(System note:")) return true;
+      // Deliberately NO bare command-shape test here. An assistant turn that
+      // merely CONTAINS {"command":...} / ###LUA### is NOT proof of a session:
+      // in a plain, never-started chat the model can simply EXPLAIN the format
+      // (docs, examples, the user pasting our README) - that false positive
+      // flipped A.started on, which armed the auto-resume watchdog, EXECUTED
+      // the quoted JSON as a real command and injected its result into a chat
+      // that had no agent at all (user-reported). A command only counts as a
+      // session signal once it was actually RUN - and an executed command is
+      // always followed by our injected "Output of '...'" feedback turn, which
+      // the test above already catches. Virtualization (the marker turns
+      // scrolling out of the DOM) is covered by the persisted per-conversation
+      // key set (startedSessions / vsStartedSessions in rememberSession), not
+      // by this heuristic.
+    }
+    return false;
+  }
+  function syncSessionState() {
+    // While a bootstrap runs, track its conversation. The bootstrap chat gets a
+    // real id only AFTER the prompt lands (fresh "/app" → "/app/<id>"), so we pin
+    // the id the first time the chat has content. A change to a DIFFERENT, EMPTY
+    // chat means the user opened a new conversation → abort: bump the generation
+    // (the in-flight startSession bails at its next checkpoint) and clear state so
+    // the new chat shows its own status instead of a stale "Starting…".
+    if (A.starting) {
+      const key = P.conversationKey();
+      if (A.startingKey == null) {
+        if (key && !P.chatIsEmpty()) A.startingKey = key; // pin the stable id
+      } else if (key !== A.startingKey && P.chatIsEmpty()) {
+        A.startGen++;
+        A.starting = false;
+        A.startingKey = null;
+        P.setInputLock(false);
+        ui.setStarting(false);
+        // CRITICAL: startSession's own finally is gated on `alive()` (this abandon
+        // just invalidated it via startGen++), so it will NEVER run and never
+        // lift the "Agent is working…" cover. Without this line the cover was
+        // stuck forever on the fresh chat whenever the user opened a new,
+        // empty conversation WHILE the bootstrap's tool call (list_commands) was
+        // still in flight - validated live 2026-07 on Cloudflare AI Playground.
+        ui.inputCover(false);
+      }
+    }
+    // Same idea for a RUNNING loop: if the user opens a NEW, empty conversation
+    // via the SITE's own new-chat (not VoidScript's button), the loop is bound to
+    // a chat the user left, so abandon it. Otherwise A.running keeps this function
+    // early-returning below and the stale "Agent active" / Stop button lingers on
+    // the fresh chat instead of "Start VoidScript". The "/app" → "/app/<id>" id
+    // assignment of the SAME chat is not a move (loopKey is pinned only once the
+    // chat has both an id and content), so a normal session is never disturbed.
+    if (A.running) {
+      const key = P.conversationKey();
+      if (A.loopKey == null) {
+        if (key && !P.chatIsEmpty()) A.loopKey = key; // pin the loop's conversation
+      } else if (key !== A.loopKey && P.chatIsEmpty()) {
+        diag("loop.abandonedNewChat", { from: A.loopKey, to: key });
+        A.stop = true;       // the loop breaks at its next checkpoint; its finally
+        A.loopKey = null;    // resets A.running / cover / lock, then state recomputes
+      }
+    }
+    if (A.starting || A.injecting || A.running) return;
+    const path = P.conversationKey();
+    const markerInDom = domHasVsSignal();
+    if (markerInDom) rememberSession(path);
+    let has;
+    if (path && path === lastSyncPath) {
+      // SAME, REAL conversation: never downgrade a known-started session just
+      // because virtualization scrolled the marker out of the DOM. "started" is
+      // sticky until the key actually changes (a different conversation).
+      // NOTE: a falsy key ("" = a transient/fresh chat with no id yet) is NEVER
+      // sticky - every fresh chat shares "", so a brief transient sweep during
+      // navigation would otherwise PIN lastSyncPath="" with has=true and then keep
+      // "Agent active" forever on the next empty chat (it would never recompute).
+      has = A.started || markerInDom || (!!path && startedSessions.has(path));
+    } else {
+      // Different conversation → recompute from scratch.
+      has = markerInDom || (!!path && startedSessions.has(path));
+      lastSyncPath = path;
+    }
+    if (has !== A.started) {
+      A.started = has;
+      ui.setStarted(has);
+    }
+  }
+
+  // Schedule a debounced sweep. requestAnimationFrame is PAUSED in a background
+  // tab, so when hidden we fall back to a timer (throttled, but it runs).
+  let sweepScheduled = false;
+  // A full sweep walks every turn. Cap it at ~8 a second so a site that mutates
+  // nonstop (Gemini's Angular, streaming) can't keep the main thread busy.
+  let lastSweepAt = 0;
+  function scheduleSweep() {
+    if (sweepScheduled || !pageSettled) return;
+    sweepScheduled = true;
+    const wait = Math.max(0, 120 - (Date.now() - lastSweepAt));
+    const run = () => {
+      sweepScheduled = false;
+      lastSweepAt = Date.now();
+      syncSessionState();
+      P.enforceComposer();  // keep the composer in the provider's required modes
+      ui.updateStartGate(); // block the input until a session is started
+      decorate.sweep();
+    };
+    if (document.hidden) setTimeout(run, Math.max(100, wait));
+    else if (wait) setTimeout(() => requestAnimationFrame(run), wait);
+    else requestAnimationFrame(run);
+  }
+  // Synchronous pre-hide: MutationObserver callbacks run as a microtask BEFORE
+  // the browser paints, but the debounced sweep above waits one extra rAF -
+  // long enough for a freshly-sent system-prompt/injected-feedback turn's raw
+  // text to paint for a single frame before decorate.sweep() builds its chip
+  // and hides it (seen live on DeepSeek: "Starting Up" flashed the raw prompt
+  // for an instant). Do the cheap whole-item hide test right here, synchronously,
+  // so the class lands before that first paint; the full sweep still runs after
+  // to build the actual chip.
+  function preHideWholeItems() {
+    // Injected turns are always the newest ones; the regular sweep covers the rest.
+    const items = P.allItems().slice(-4);
+    // Optimistic pre-hide of a freshly injected result turn (armed in
+    // submitAndGetBase). The text-based match below can only fire once the
+    // "Output of '…'" caption has rendered, but the turn's NODE appears first
+    // (with its attached image) and the caption fills a tick later - so the raw
+    // output would flash until a post-send sweep nudge. We know the newest user
+    // turn in this window is ours: hide it on sight (blank, no raw text), and let
+    // the normal sweep swap in the real "· result" chip when the caption lands.
+    if (A.injectHideUntil && Date.now() < A.injectHideUntil) {
+      const users = items.filter((it) => P.isUserItem(it));
+      const last = users[users.length - 1];
+      if (last && !last.classList.contains("vs-hidden") &&
+          users.length > (A.injectPreUser || 0)) {
+        last.classList.add("vs-hidden");
+        A.injectHideUntil = 0; // one-shot: this turn is now masked
+        diag("result.prehide", { users: users.length });
+      }
+    }
+    for (const item of items) {
+      if (item.classList.contains("vs-hidden")) continue;
+      const txt = P.classifyText(item, ".vs-chip");
+      if (txt.includes(VS.SYS_MARKER) ||
+          (P.isUserItem(item) && VSParse.isInjectedFeedback(txt))) {
+        item.classList.add("vs-hidden");
+      }
+    }
+  }
+  // Coalesce mutation bursts to ONE pass per frame. On a streaming site (ChatGPT
+  // etc.) this observer fires hundreds of times a second as tokens land; running the
+  // full-DOM preHideWholeItems() scan on every single mutation pegged the CPU and
+  // could freeze the tab on slower machines. rAF-debouncing it keeps camouflage
+  // instant (next frame) while doing the scan at most once per frame.
+  let moScheduled = false;
+  // Our own chip/bar inserts also land here. Reacting to them re-runs the sweep,
+  // which touches the DOM again - on Gemini that loop never settled and could
+  // freeze or crash the tab on long chats. Skip batches that are only ours.
+  const ours = (n) => n.nodeType !== 1 ? n.nodeType === 3 && !!n.parentElement && ours(n.parentElement)
+    : n.id === "vs-root" || !!n.closest("#vs-root, .vs-chip");
+  const onlyOurs = (recs) => recs.every((r) =>
+    ours(r.target) || ([...r.addedNodes, ...r.removedNodes].length > 0 && [...r.addedNodes, ...r.removedNodes].every(ours)));
+  const mo = new MutationObserver((recs) => {
+    if (moScheduled || !pageSettled || onlyOurs(recs)) return;
+    moScheduled = true;
+    requestAnimationFrame(() => {
+      moScheduled = false;
+      preHideWholeItems();
+      scheduleSweep();
+    });
+  });
+  mo.observe(document.documentElement, { childList: true, subtree: true });
+  whenSettled.then(() => { preHideWholeItems(); scheduleSweep(); hideByMarker(); });
+  // Selector-free safety net. Every message we inject ends with VS_END and starts
+  // with a known head, so on any site - including ones whose turn selectors are
+  // stale - we can find the block holding the whole message and hide its turn.
+  const VS_HEAD = /^\s*(⟦VS-SYS⟧|⟦VOID:STEER⟧|Output of '|ERROR\b|\(System note:)/;
+  const LABEL_MAX = 60; // "You said:", "Edit", "Copy" - chrome around a turn
+  function hideByMarker() {
+    if (document.hidden || !document.body) return;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => n.nodeValue.includes(VS_END) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
+    });
+    let n;
+    while ((n = w.nextNode())) {
+      let el = n.parentElement;
+      if (!el || el.closest(".vs-hidden, #vs-root, .vs-chip, [contenteditable], textarea, form")) continue;
+      // Lowest ancestor holding the whole message: starts with our head (a short
+      // label like "You said:" may come first).
+      const starts = (e) => { const t = e.textContent; const i = t.search(VS_HEAD); return i >= 0 && i <= LABEL_MAX && VS_HEAD.test(t.slice(i)); };
+      for (let i = 0; el && el !== document.body && i < 12 && !starts(el); i++) el = el.parentElement;
+      if (!el || el === document.body || !starts(el)) continue; // a reply quoting our tag
+      // Then widen to the turn: keep climbing while the parent only adds labels.
+      // A recognised turn wins, so the normal chip path keeps working where it can.
+      while (el.parentElement && el.parentElement !== document.body &&
+             !P.isUserItem(el) && !P.isAssistantItem(el) &&
+             el.parentElement.textContent.length - el.textContent.length <= LABEL_MAX) el = el.parentElement;
+      if (P.isAssistantItem(el)) continue;
+      if (!el.classList.contains("vs-hidden")) { el.classList.add("vs-hidden"); diag("hide.marker", { tag: el.tagName }); }
+    }
+  }
+  let markerTimer = 0;
+  new MutationObserver((recs) => {
+    if (markerTimer || !pageSettled || onlyOurs(recs)) return;
+    markerTimer = setTimeout(() => { markerTimer = 0; hideByMarker(); }, 400);
+  }).observe(document.documentElement, { childList: true, subtree: true });
+  // Belt-and-braces: a low-frequency sweep regardless of tab visibility or
+  // mutation timing, so camouflage always converges.
+  setInterval(scheduleSweep, 1500);
+  // When the user returns to the tab, immediately refresh camouflage/state.
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) scheduleSweep(); });
+
+  syncSessionState();
+
+  // Live settings sync: when the popup (or another tab) changes a VoidScript setting
+  // in chrome.storage, apply it to THIS running page immediately - no reload needed.
+  // Covers the popup's quick toggles (Co-work, auto-verify, guard, background…) and
+  // the theme picker.
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      let touched = false;
+      for (const k in changes) {
+        if (Object.prototype.hasOwnProperty.call(VS_CFG_DEFAULTS, k)) {
+          VS_CFG[k] = changes[k].newValue;
+          touched = true;
+          if (k === "vsCowork" && changes[k].newValue === false) A.steerQueue = [];
+          if (k === "vsTheme") {
+            const t = changes[k].newValue;
+            if (!t || t === "system") document.documentElement.removeAttribute("data-vs-theme");
+            else document.documentElement.setAttribute("data-vs-theme", t);
+          }
+        }
+      }
+      if (touched) { try { ui.updateStartGate(); } catch {} }
+    });
+  } catch {}
+
+  // User-send interception: the provider wires the site's composer events to
+  // these callbacks.
+  P.installSendHooks({
+    isBlocked: () => A.injecting || A.running || A.starting,
+    isStarted: () => A.started,
+    onBlockedAttempt: () => ui.nudgeStart(),
+    onUserMessage: (base) => {
+      // A fresh user message = fresh intent: clear any previous manual stop so
+      // the loop is allowed to run again.
+      A.userStopped = false;
+      captureSendToken(); // identity of the assistant turn before this reply
+      // A Stop clicked during this 300ms window sets A.userStopped → honor it and
+      // do NOT start the loop (otherwise the stop is silently ignored and the
+      // freshly-started loop strands the "Stopping…" flag).
+      setTimeout(() => { if (!A.running && !A.userStopped) agentLoop(base); }, 300);
+    },
+    onNativeStop: () => {
+      // A click on the site's own stop = a deliberate manual stop → suppress
+      // auto-resume.
+      A.userStopped = true;
+      A.stop = true;
+      A.resumeArmed = false; // a stop overrides any pending regenerate grace
+      clearLoopResume();     // a deliberate stop must never auto-resume after a reload
+      A.stopAt = Date.now(); // grace anchor for the regenerate-as-resume gates
+      // Same growth baseline as stopLoop: the stop-retry self-heal must only
+      // re-click if the stream keeps writing past this point (see stop.retry).
+      A.stopStreamLen = P.streamLen ? P.streamLen() : 0;
+      // If our loop is live, mirror the same "Stopping…" feedback as our own
+      // Stop button so the bar reflects the wind-down instead of flickering.
+      if (A.running && !A.stopping) { A.stopping = true; ui.markStopping(); }
+      markStoppedTurn();
+      diag("nativeStop");
+    },
+    onNativeContinue: () => {
+      // The site's "Continue" button = a clear intent to RESUME after a stop/
+      // truncation. Clear the manual-stop latch so auto-resume can pick the
+      // (resumed) turn's tool call back up cleanly.
+      A.userStopped = false;
+      A.stop = false;
+      const it = P.lastAssistant();   // a real resume → drop the stopped marker
+      if (it) { delete it.dataset.zStopped; forgetHalted(it); }
+      diag("nativeContinue");
+    },
+  });
+
+  // Auto-resume watchdog - the safety net that keeps the agentic loop alive when
+  // a tool call finished AFTER the loop finalized early (huge multi_edit, tab
+  // returning from background). It must NEVER fire on a tool call merely
+  // PRESENT in the DOM without a fresh live generation. Guards:
+  //   • A.userStopped - the user halted; never relaunch against their intent.
+  //   • lastGenAt recency - only resume a turn from a generation in the last
+  //     few seconds; a turn rendered by load/scroll has no recent generation.
+  //   • turnHalted - the turn itself carries the site's "stopped" marker.
+  // Each turn is still resumed at most once (zResume marker).
+  const RESUME_FRESH_MS = 8000;
+  setInterval(() => {
+    if (!A.started || A.running || A.starting || A.injecting) return;
+    if (document.hidden && !bgMode()) return;              // hidden → skip (agentLoop gates too); background mode lets it run off-screen
+    if (A.userStopped) return;                          // user halted → never relaunch
+    if (P.isGenerating()) return;
+     if (Date.now() - A.lastGenAt > RESUME_FRESH_MS) return; // not a fresh live turn
+    // Free recovery: if generation appears STUCK (generating flag on with text that
+    // never changes past the provider's STABLE_MS threshold), nudge the site's native
+    // stop button once to snap it out of a wedged state. This fixes the "AI froze,
+    // no output, the bar spins forever" class of hangs on generic/beta providers
+    // whose stop selector is stale or whose stream ended without clearing it.
+    // Guarded by zRecover so we never fire it twice on the same stuck turn.
+    if (!A.recovering && A.started && !A.running && P.isGenerating && P.stopGeneration) {
+      const la = P.lastAssistant && P.lastAssistant();
+      if (la && !la.dataset.zRecover && Date.now() - (A.lastGenAt || 0) > 5000) {
+        la.dataset.zRecover = "1";
+        A.recovering = true;
+        // Fire ONE native stop click to break the stuck state; if this frees the
+        // turn the auto-resume block below picks up the command.
+        try { P.stopGeneration(); } catch {}
+        diag("recover.stopGeneration", {});
+      }
+    }
+    const item = P.lastAssistant();
+    if (!item || item.dataset.zloop) return;
+    // Never resume the turn that already existed when this session started - it is
+    // a reload-restored generation, not a reply to one of our sends (see
+    // A.bootBaselineId). Guards the "execute_luau leaked into the new chat" bug.
+    if (A.bootBaselineId && P.lastAssistantId && P.lastAssistantId() === A.bootBaselineId) return;
+    if (P.turnHalted(item)) return;                     // this turn was stopped → leave it
+    // Scrolled-back OLD turn guard (virtualization). lastAssistant() is the last
+    // RENDERED turn; scrolling up makes it an old command whose id is below the
+    // session's high-water mark. Its result row may be off-screen (unrendered), so
+    // the result-below guard alone can miss it - this catches it directly. Only
+    // applies when the provider exposes a numeric monotonic id (DeepSeek).
+    const curId = P.itemKey ? Number(P.itemKey(item)) : NaN;
+    if (Number.isFinite(curId) && A.maxTurnId != null && curId < A.maxTurnId) {
+      // Log once per distinct turn, not every 1s tick while the user stays up.
+      if (A._skipOldId !== curId) { A._skipOldId = curId; diag("resume.skipOld", { curId, maxTurnId: A.maxTurnId }); }
+      return;
+    }
+    // Settled-history guard (survives a page reload, unlike the executed map).
+    // A genuine resume target is a command whose tool NEVER produced a result;
+    // it has NO injected-feedback turn after it. Every ALREADY-EXECUTED command
+    // is followed by its injected result. On a virtualized list, scrolling up
+    // makes lastAssistant() an OLD command turn AND flickers isGenerating() true
+    // (sampleStream resets on the node change), refreshing lastGenAt - so the
+    // freshness guard alone doesn't stop it, and after a reload the executed map
+    // is empty. Keying off the result-below turn robustly separates the in-flight
+    // command from settled history: a scrolled-back tool with its result already
+    // present is never re-fired. (Confirmed live: same-conv reload + scroll up
+    // re-executed a historical command.)
+    const all = P.allItems();
+    const after = all[all.indexOf(item) + 1];
+    if (after && P.isUserItem(after) &&
+        VSParse.isInjectedFeedback(P.classifyText(after, ".vs-chip"))) return;
+    const txt = P.itemText(item);
+    if (!VSParse.hasToolSignature(txt)) return;
+    // Node-independent dedupe: this turn's command was already dispatched (by the
+    // loop or a prior resume). The dataset guards below are wiped when the site
+    // recreates the node on scroll, so without this off-DOM check the watchdog
+    // re-runs a historical tool with no live generation. See the `executed` map.
+    if (isRememberedExecuted(item, txt)) return;
+    // Resume only when a COMPLETE, parseable command is present - and re-attempt
+    // if the turn has GROWN since our last try.
+    if (!VSParse.parseToolCalls(txt).length) return;
+    const len = txt.length;
+    if (item.dataset.zResume && Number(item.dataset.zResumeLen || 0) >= len) return;
+    item.dataset.zResume = "1";
+    item.dataset.zResumeLen = String(len);
+    rememberExecuted(item);
+    A.recovering = false; // recovery fired successfully; clear for next turn
+    diag("autoResume", { len });
+    // The reply turn is ALREADY present - act on it immediately. Null token makes
+    // the identity-based newReply test unconditionally true (any current id != null).
+    A.sendToken = null;
+    agentLoop(P.assistantCount() - 1);
+  }, 1000);
+
+  log(`VoidScript content script ready (provider: ${P.id})`);
+})();

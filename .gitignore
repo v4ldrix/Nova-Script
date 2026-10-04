@@ -1,0 +1,26 @@
+﻿# Local-only folders
+Compressed/
+Deprecated/
+ExtensionPresentation/
+presentation/
+docs/
+
+# Zip files
+*.zip
+
+# Local dev / diagnostic tools
+probe.py
+logs/
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+__pycache__/
+
+# Editor/AI tooling scratch
+.kilo/
+
+# Built app and release leftovers (the exe ships in the release zip, see make-release.bat)
+VoidScript.exe
+*.old

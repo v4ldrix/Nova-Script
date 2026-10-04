@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "roblox": {
+      "args": [],
+      "command": "launch_studio_mcp.py"
+    }
+  }
+}

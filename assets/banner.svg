@@ -1,0 +1,47 @@
+<svg width="640" height="160" viewBox="0 0 640 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VoidScript logo">
+  <defs>
+    <linearGradient id="l-bg" x1="0" y1="0" x2="640" y2="160" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#16161e"/>
+      <stop offset="1" stop-color="#0a0a10"/>
+    </linearGradient>
+    <linearGradient id="l-ring" x1="24" y1="34" x2="120" y2="126" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9aa8ff"/>
+      <stop offset="0.55" stop-color="#7c8cff"/>
+      <stop offset="1" stop-color="#5b46f0"/>
+    </linearGradient>
+    <radialGradient id="l-void" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#05050a"/>
+      <stop offset="0.7" stop-color="#0c0c16"/>
+      <stop offset="1" stop-color="#1a1730"/>
+    </radialGradient>
+    <linearGradient id="l-script" x1="352" y1="52" x2="600" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9aa8ff"/>
+      <stop offset="1" stop-color="#6b5cff"/>
+    </linearGradient>
+    <filter id="l-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="640" height="160" rx="24" fill="url(#l-bg)"/>
+
+  <!-- icon mark -->
+  <g transform="translate(16,16)">
+    <circle cx="64" cy="64" r="33" fill="url(#l-void)"/>
+    <circle cx="64" cy="64" r="33" fill="none" stroke="url(#l-ring)" stroke-width="5.5" filter="url(#l-glow)"/>
+    <path d="M64 31 A33 33 0 0 1 95 55" fill="none" stroke="#c7ccff" stroke-width="2" stroke-linecap="round" opacity="0.55"/>
+    <g stroke="url(#l-ring)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none" filter="url(#l-glow)">
+      <polyline points="55,52 43,64 55,76"/>
+      <polyline points="73,52 85,64 73,76"/>
+      <line x1="68" y1="49" x2="60" y2="79"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="'Segoe UI', system-ui, -apple-system, sans-serif" font-weight="700" font-size="58" letter-spacing="-1">
+    <text x="150" y="98" fill="#f2f2f7">Void</text>
+    <text x="286" y="98" fill="url(#l-script)">Script</text>
+  </g>
+  <text x="152" y="128" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="17" letter-spacing="3.5" fill="#8b8b9a">AI · ROBLOX STUDIO AGENT</text>
+</svg>
