@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # creatives.py
 # ---------------------------------------------------------------------------
-#  VoidScript "creatives" - embedded bridge tools for Roblox animation and VFX
+#  NovaScript "creatives" - embedded bridge tools for Roblox animation and VFX
 #  generation. Nothing here needs an external program: everything is compiled
 #  to Luau and executed straight inside Roblox Studio through the Roblox MCP
 #  server's `execute_luau` tool.
@@ -500,7 +500,7 @@ def build_animation_luau(*, name, rig, style, duration, fps, loop=False, keyfram
     frames_json = json.dumps(frames, separators=(",", ":"))
     loop_lua = "true" if loop else "false"
 
-    return f"""-- VoidScript generated animation "{name}" (style {style_key})
+    return f"""-- NovaScript generated animation "{name}" (style {style_key})
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ClipProvider = game:GetService("AnimationClipProvider")
@@ -553,10 +553,10 @@ end
 -- user can apply later. It only plays when a rig is found.
 local played = false
 
-local folder = ReplicatedStorage:FindFirstChild("VoidScriptAnimations")
+local folder = ReplicatedStorage:FindFirstChild("NovaScriptAnimations")
 if not folder then
     folder = Instance.new("Folder")
-    folder.Name = "VoidScriptAnimations"
+    folder.Name = "NovaScriptAnimations"
     folder.Parent = ReplicatedStorage
 end
 
@@ -726,7 +726,7 @@ else
     playNote = " - ready to play once a rig is in the scene"
 end
 return string.format(
-    "[VoidScript] ANIMATION DONE. '%s' created and playable: %d keyframes, %.2f s, %d fps (%s mode), %s%s. NO asset upload, NO animation ID needed - the animation is ready now. KeyframeSequence also saved under ReplicatedStorage.VoidScriptAnimations.",
+    "[NovaScript] ANIMATION DONE. '%s' created and playable: %d keyframes, %.2f s, %d fps (%s mode), %s%s. NO asset upload, NO animation ID needed - the animation is ready now. KeyframeSequence also saved under ReplicatedStorage.NovaScriptAnimations.",
     ANIM_NAME, count, {duration}, {fps}, mode, modeNote, playNote)
 """
 
@@ -844,7 +844,7 @@ def build_vfx_luau(*, effect, parent, position, scale, color_a, color_b, duratio
     position = (position or "").strip()
 
     L = []
-    _w(L, 0, "-- VoidScript generated VFX: %s" % key)
+    _w(L, 0, "-- NovaScript generated VFX: %s" % key)
     _w(L, 0, 'local Workspace = game:GetService("Workspace")')
     _w(L, 0, 'local Debris = game:GetService("Debris")')
     _w(L, 0, 'local Selection = game:GetService("Selection")')
@@ -856,7 +856,7 @@ def build_vfx_luau(*, effect, parent, position, scale, color_a, color_b, duratio
     _w(L, 0, "local hostPart = nil")
     _w(L, 0, 'if PARENT ~= "" then')
     _w(L, 1, "local hit = Workspace:FindFirstChild(PARENT, false)")
-    _w(L, 1, "if not hit then error(\"[VoidScript] vs_make_vfx: parent %q not found in Workspace.\" .. PARENT) end")
+    _w(L, 1, "if not hit then error(\"[NovaScript] vs_make_vfx: parent %q not found in Workspace.\" .. PARENT) end")
     _w(L, 1, "hostPart = hit:IsA(\"BasePart\") and hit or nil")
     _w(L, 1, "if not hostPart then")
     _w(L, 2, "for _, d in ipairs(hit:GetDescendants()) do if d:IsA(\"BasePart\") then hostPart = d; break end end")
@@ -868,7 +868,7 @@ def build_vfx_luau(*, effect, parent, position, scale, color_a, color_b, duratio
     _w(L, 2, "hostPart.Anchored = true; hostPart.CanCollide = false; hostPart.Transparency = 1; hostPart.Parent = Workspace")
     _w(L, 1, "end")
     _w(L, 0, "end")
-    _w(L, 0, "if not hostPart then error(\"[VoidScript] vs_make_vfx: no BasePart to attach to.\") end")
+    _w(L, 0, "if not hostPart then error(\"[NovaScript] vs_make_vfx: no BasePart to attach to.\") end")
     _w(L, 0, "ROOT = hostPart")
     _w(L, 0, "")
     _w(L, 0, "local att = Instance.new(\"Attachment\")")
@@ -880,7 +880,7 @@ def build_vfx_luau(*, effect, parent, position, scale, color_a, color_b, duratio
     _w(L, 0, "att.Parent = ROOT")
     _w(L, 0, "")
     _w(L, 0, 'local holder = Instance.new("Folder")')
-    _w(L, 0, "holder.Name = \"VoidScriptVFX_%s\"" % key)
+    _w(L, 0, "holder.Name = \"NovaScriptVFX_%s\"" % key)
     _w(L, 0, "holder.Parent = ROOT")
     _w(L, 0, "Debris:AddItem(holder, LIFETIME)")
     _w(L, 0, "Debris:AddItem(att, LIFETIME)")
@@ -1379,7 +1379,7 @@ def build_vfx_luau(*, effect, parent, position, scale, color_a, color_b, duratio
         })
 
     _w(L, 0, "")
-    _w(L, 0, 'return string.format("[VoidScript] VFX %%q built on %%s at %%s", %s, ROOT:GetFullName(), POS ~= "" and POS or "origin")'
+    _w(L, 0, 'return string.format("[NovaScript] VFX %%q built on %%s at %%s", %s, ROOT:GetFullName(), POS ~= "" and POS or "origin")'
          % ('"%s"' % key,))
     return "\n".join(L)
 
@@ -1451,7 +1451,7 @@ EMBEDDED_TOOLS = [
          "You may EITHER pick a built-in 'style', OR author the animation yourself keyframe-by-keyframe with the 'keyframes' "
          "JSON (exact bone motion, full control). "
          "Works with NO rig in the scene: the KeyframeSequence (an AnimationClip) is still created and registered as a "
-         "playable local preview, and it is saved under ReplicatedStorage.VoidScriptAnimations for the "
+         "playable local preview, and it is saved under ReplicatedStorage.NovaScriptAnimations for the "
          "user to apply later; it only auto-plays when a rig is found (the live player, the Studio selection, or "
          "the 'rig' Model). If the clip API is blocked (e.g. running game without the Animation capability), the tool "
          "AUTOMATICALLY plays the same keyframes by driving the rig's joints directly, so the animation is still visible on "

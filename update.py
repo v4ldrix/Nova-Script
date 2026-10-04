@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# update.py - VoidScript auto-updater.
+# update.py - NovaScript auto-updater.
 #
 #   python update.py --auto    fully automatic mode (used by start.bat):
 #                              silently downloads+applies a newer release and
@@ -25,7 +25,7 @@ import time
 import urllib.request
 import zipfile
 
-REPO = "cjl26rg2/Void-Script"
+REPO = "v4ldrix/Nova-Script"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{REPO}/releases"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_update.json")
@@ -33,7 +33,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_upd
 CHECK_TTL_SEC = 3600
 # Paths that must never be overwritten by a release swap.
 PRESERVE = {"config.json", "logs"}
-USER_AGENT = "VoidScript-Updater/2.0"
+USER_AGENT = "NovaScript-Updater/2.0"
 
 
 def log(msg):
@@ -55,7 +55,7 @@ def read_installed_version():
     # (whichever is higher). A maintainer may tag V2.0.1 but ship a zip whose
     # manifest still says 2.0.0; we apply the tag anyway, and remembering it
     # here stops the updater from re-applying the same release every launch.
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voidscript-extension", "manifest.json")
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "novascript-extension", "manifest.json")
     manifest = "0.0.0"
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -158,7 +158,7 @@ def move_over(src, dst):
             try:
                 os.remove(dst)
             except OSError:
-                # A running VoidScript.exe can't be deleted or overwritten, but
+                # A running NovaScript.exe can't be deleted or overwritten, but
                 # Windows does allow RENAMING it. Move it aside as *.old (the
                 # launcher deletes those on its next start) so the new file can
                 # take its place - instead of shutil.move failing half-way through
@@ -201,16 +201,16 @@ def perform_swap(tag, url, quiet=False):
         entries = os.listdir(extracted)
         if len(entries) == 1 and os.path.isdir(os.path.join(extracted, entries[0])):
             extracted = os.path.join(extracted, entries[0])
-        # Sanity: a real VoidScript release always ships these.
+        # Sanity: a real NovaScript release always ships these.
         if not os.path.exists(os.path.join(extracted, "bridge.py")) or not os.path.exists(
-            os.path.join(extracted, "voidscript-extension", "manifest.json")
+            os.path.join(extracted, "novascript-extension", "manifest.json")
         ):
             if not quiet:
-                log("[update] Downloaded file does not look like a VoidScript release. Aborting - nothing was changed.")
+                log("[update] Downloaded file does not look like a NovaScript release. Aborting - nothing was changed.")
             return False
         new_version = "0.0.0"
         try:
-            with open(os.path.join(extracted, "voidscript-extension", "manifest.json"), "r", encoding="utf-8") as f:
+            with open(os.path.join(extracted, "novascript-extension", "manifest.json"), "r", encoding="utf-8") as f:
                 new_version = json.load(f).get("version", "0.0.0")
         except Exception:
             pass

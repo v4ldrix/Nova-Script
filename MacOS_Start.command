@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# VoidScript launcher (macOS / Linux). Double-clickable in Finder (.command so
+# NovaScript launcher (macOS / Linux). Double-clickable in Finder (.command so
 # Finder runs it instead of opening an editor). Finds Python, makes sure the
 # `websockets` dependency is present, frees the bridge port if a stale instance
 # is holding it, then runs bridge.py. Windows equivalent: start.bat. Kept
-# GPL-3.0 as part of the VoidScript project.
+# GPL-3.0 as part of the NovaScript project.
 set -u
 
 cd "$(dirname "$0")" || exit 1
@@ -51,7 +51,7 @@ keepopen() {
   echo
   echo "  ${RED}##############################################################${R}"
   echo "  ${RED}##${R}   ${B}${WHT}KEEP THIS WINDOW OPEN${R} ${DIM}-${R} ${RED}DO NOT CLOSE IT${R}                ${RED}##${R}"
-  echo "  ${RED}##${R}   ${DIM}VoidScript stops the moment this closes. Just${R}          ${RED}##${R}"
+  echo "  ${RED}##${R}   ${DIM}NovaScript stops the moment this closes. Just${R}          ${RED}##${R}"
   echo "  ${RED}##${R}   ${DIM}minimize it and leave it running in the background.${R}    ${RED}##${R}"
   echo "  ${RED}##############################################################${R}"
   echo
@@ -63,7 +63,7 @@ logline "==== launcher started (port $PORT) ===="
 # ---- 0. bridge.py must sit next to us --------------------------------------
 if [ ! -f bridge.py ]; then
   fail "bridge.py is not next to this launcher."
-  echo "  Extract the WHOLE download, then run VoidScript from that folder."
+  echo "  Extract the WHOLE download, then run NovaScript from that folder."
   logline "ABORT: bridge.py missing."
   hold 1
 fi
@@ -100,7 +100,7 @@ if [ -f update.py ]; then
       echo "  Reload the extension at chrome://extensions after this restarts."
       logline "auto-update applied: $UPAUTO"
       echo
-      echo "  ${VIO}Restarting VoidScript with the new version...${R}"
+      echo "  ${VIO}Restarting NovaScript with the new version...${R}"
       exec bash "$SELF"
       ;;
   esac

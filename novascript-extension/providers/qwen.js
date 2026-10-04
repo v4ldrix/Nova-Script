@@ -318,7 +318,7 @@ const VSProvider = (() => {
   const assistantCount = () => assistantItems().length;
   const userCount = () => document.querySelectorAll(S.userItem).length;
 
-  // Scope to the site's composer only; skip VoidScript's own injected textarea
+  // Scope to the site's composer only; skip NovaScript's own injected textarea
   // (#vs-set-text inside #vs-root) so login pages without a site editor return
   // null and the send-hook guards stay intact.
   const getEditor = () => {
@@ -649,7 +649,7 @@ const VSProvider = (() => {
     if (!text || text.length <= SEND_CAP) return text;
     const omitted = text.length - SEND_MAX;
     const marker =
-      `\n\n[…VoidScript: result truncated to fit Qwen's ${SEND_CAP}-character input ` +
+      `\n\n[…NovaScript: result truncated to fit Qwen's ${SEND_CAP}-character input ` +
       `limit - ${omitted} of ${text.length} characters omitted. Do NOT re-run the ` +
       `command; work with the head and tail shown here…]\n\n`;
     const budget = SEND_MAX - marker.length;
@@ -724,7 +724,7 @@ const VSProvider = (() => {
     const arr = new Uint8Array(bin.length);
     for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
     const ext = mime.includes("png") ? "png" : "jpg";
-    return new File([arr], `voidscript_${Date.now()}_${i}.${ext}`, { type: mime });
+    return new File([arr], `novascript_${Date.now()}_${i}.${ext}`, { type: mime });
   }
   // The PENDING upload's preview: Qwen mounts each staged image as
   // `img.vision-item-image` in the composer's `.file-card-list`. A SENT image
@@ -866,7 +866,7 @@ const VSProvider = (() => {
 
   // NOTE: an "⚠ unstable" badge used to be injected next to Qwen's "Auto"/"Think"
   // thinking-modes, on the theory that those modes fired the model's OWN native
-  // tool-calls instead of VoidScript commands. Removed 2026-07: the real cause of
+  // tool-calls instead of NovaScript commands. Removed 2026-07: the real cause of
   // the flaky thinking-mode turns was the premature-`done` regression (Qwen's SSE
   // emitting `status:"finished"` ~12s before the stream ends - see genActive and
   // qwen-net.js), which made the loop fire the still-incomplete command mid-stream.

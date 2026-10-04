@@ -1,7 +1,7 @@
 # # SPDX-License-Identifier: GPL-3.0-or-later
 # bridge.py
 # ──────────────────────────────────────────────────────────────────────────
-#  VoidScript Bridge
+#  NovaScript Bridge
 #  Local WebSocket <-> Roblox Studio MCP server.
 #  The browser extension talks to this over ws://127.0.0.1:<PORT>.
 #
@@ -89,7 +89,7 @@ def _enable_ansi_colors():
 
 
 HOST = "127.0.0.1"
-# Keep in sync with voidscript-extension/manifest.json "version" - printed at
+# Keep in sync with novascript-extension/manifest.json "version" - printed at
 # startup so a user's terminal output alone tells us which build they're on.
 BRIDGE_VERSION = "6.1.0"
 PORT = int(os.environ.get("VS_BRIDGE_PORT", "17613"))
@@ -97,7 +97,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
 # The primary server. It is always present, added by the installer, and can
-# never be edited/removed through the extension (it is what VoidScript is FOR).
+# never be edited/removed through the extension (it is what NovaScript is FOR).
 PRIMARY_SERVER_ID = "roblox"
 
 if _enable_ansi_colors():
@@ -577,9 +577,9 @@ def _reclaim_bridge_port():
     cmdline = _process_cmdline(pid_i)
     if "bridge.py" not in cmdline.lower():
         log(f"port {PORT} is held by pid {pid_i} ('{name}') but it does not look "
-            f"like a VoidScript bridge - leaving it alone.", "yl")
+            f"like a NovaScript bridge - leaving it alone.", "yl")
         return False
-    log(f"port {PORT} is held by a leftover VoidScript bridge (pid {pid_i}) from a "
+    log(f"port {PORT} is held by a leftover NovaScript bridge (pid {pid_i}) from a "
         "previous session - killing it so this one can start.", "yl")
     try:
         subprocess.run(["taskkill", "/F", "/PID", str(pid_i)],
@@ -1175,7 +1175,7 @@ class MCPClient:
                 self._request("initialize", {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "voidscript-bridge", "version": "1.0"},
+                    "clientInfo": {"name": "novascript-bridge", "version": "1.0"},
                 }, timeout=30)
                 self._notify("notifications/initialized")
                 # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
@@ -1556,7 +1556,7 @@ class MCPManager:
                                        timeout)
                 text = res.get("text", "")
             return {
-                "text": f"[VoidScript] {generated.get('label', name)}\n" + text,
+                "text": f"[NovaScript] {generated.get('label', name)}\n" + text,
                 "images": res.get("images", []),
             }
         with self.index_lock:
@@ -1872,7 +1872,7 @@ async def handler(ws):
     origin = _ws_header(ws, "Origin")
     if not _origin_allowed(origin):
         log(f"SECURITY: rejected connection from origin {origin!r} (peer {peer}) - "
-            f"not a VoidScript extension origin. Set VS_ALLOWED_ORIGINS to allow it.", "rd")
+            f"not a NovaScript extension origin. Set VS_ALLOWED_ORIGINS to allow it.", "rd")
         try:
             await ws.close(code=4403, reason="origin not allowed")
         except Exception:
@@ -2446,9 +2446,9 @@ def _startup_marker():
     if sys.platform == "win32":
         folder = os.path.join(os.environ.get("APPDATA", ""),
                               "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-        return os.path.join(folder, "VoidScript Bridge.bat"), folder
+        return os.path.join(folder, "NovaScript Bridge.bat"), folder
     folder = os.path.expanduser("~/Library/LaunchAgents")
-    return os.path.join(folder, "com.voidscript.bridge.plist"), folder
+    return os.path.join(folder, "com.novascript.bridge.plist"), folder
 
 
 def install_startup():
@@ -2468,7 +2468,7 @@ def install_startup():
         # macOS LaunchAgent that runs this bridge headless.
         os.makedirs(folder, exist_ok=True)
         plist = {
-            "Label": "com.voidscript.bridge",
+            "Label": "com.novascript.bridge",
             "ProgramArguments": [sys.executable, os.path.join(HERE, "bridge.py")],
             "RunAtLoad": True,
             "KeepAlive": False,
@@ -2525,7 +2525,7 @@ async def diagnose_cli():
 
 
 async def main():
-    print(f"\n{C['cy']}  VoidScript Bridge v{BRIDGE_VERSION}{C['reset']}  {C['dim']}- Roblox Studio - ws://{HOST}:{PORT}{C['reset']}\n")
+    print(f"\n{C['cy']}  NovaScript Bridge v{BRIDGE_VERSION}{C['reset']}  {C['dim']}- Roblox Studio - ws://{HOST}:{PORT}{C['reset']}\n")
     log(f"===== BRIDGE START  v{BRIDGE_VERSION}  pid={os.getpid()}  log={LOG_PATH} =====", "cy")
     if os.environ.get("VS_ALLOW_ANY_ORIGIN") == "1":
         log("security: origin check DISABLED (VS_ALLOW_ANY_ORIGIN=1) - only use this if you know the risks", "yl")
@@ -2751,7 +2751,7 @@ async def main():
         if getattr(e, "errno", None) in (98, 10048) or "10048" in str(e):
             owner = await asyncio.to_thread(_port_owner, PORT)
             who = f" by '{owner[1]}' (pid {owner[0]})" if owner else ""
-            # Most often it's another bridge: VoidScript.exe already started one, or
+            # Most often it's another bridge: NovaScript.exe already started one, or
             # ZeroScript (same port) is open. Ask it - a bridge answers a ping.
             other = None
             try:
@@ -2761,8 +2761,8 @@ async def main():
             except Exception:
                 pass
             if other and other.get("type") in ("pong", "connected", "status"):
-                log("VoidScript (or ZeroScript) is already running on this PC - that's what is using the port.", "yl")
-                log("    If VoidScript.exe is open, you don't need start.bat: the app runs the bridge for you.", "yl")
+                log("NovaScript (or ZeroScript) is already running on this PC - that's what is using the port.", "yl")
+                log("    If NovaScript.exe is open, you don't need start.bat: the app runs the bridge for you.", "yl")
                 log("    If ZeroScript is running, close its window first - both use the same port.", "yl")
                 return
             log(f"could not start: port {PORT} is already in use{who}.", "rd")

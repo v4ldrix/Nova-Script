@@ -8,7 +8,7 @@ const VS = (() => {
 
   // Display name + unique marker injected at the top of the system prompt so the
   // content script can reliably recognise (and camouflage) the bootstrap turn.
-  const APP_NAME = "VoidScript";
+  const APP_NAME = "NovaScript";
   const SYS_MARKER = "⟦VS-SYS⟧";
 
   // ── Tool → visual category (icon + colour theme for the chips) ─────────
@@ -47,12 +47,12 @@ const VS = (() => {
       const objAlt = otherCmd ? "" : " (or ###...### block)";
       const notes = {
         malformed:
-          "ERROR: a VoidScript command was detected in your reply but its JSON could not be parsed. " +
+          "ERROR: a NovaScript command was detected in your reply but its JSON could not be parsed. " +
           'Rewrite it as a single valid JSON object in plain text, exactly like {"command": "name", "params": {...}}' +
           luaMalformed + ". You may add a short note around it. " +
           "Please retry.",
         unclosed:
-          "ERROR: your VoidScript command was cut off before it finished - the JSON object" +
+          "ERROR: your NovaScript command was cut off before it finished - the JSON object" +
           objAlt + " never closed, so it could not run. Rewrite the WHOLE command in one " +
           'piece as valid JSON, exactly like {"command": "name", "params": {...}}' +
           luaUnclosed + ". Please retry.",
@@ -86,7 +86,7 @@ const VS = (() => {
       "confirm it is back; otherwise run list_mcp_servers and continue on another connected " +
       "server for anything that does not need Roblox.",
     bridgeOffline:
-      "ERROR: the local VoidScript bridge is unreachable, so no command could run. " +
+      "ERROR: the local NovaScript bridge is unreachable, so no command could run. " +
       "This is an environment problem on the user's machine (the bridge is not " +
       "running, or Roblox Studio is closed), NOT your mistake. Tell the user in " +
       "one short sentence that the bridge or Roblox Studio is offline, then stop " +
@@ -96,16 +96,16 @@ const VS = (() => {
       "finished. Continue from exactly where you stopped. Do NOT restart and do " +
       "NOT repeat what you already wrote.)",
     compact:
-      "(System note: this chat is about to hit its context limit, so VoidScript is " +
+      "(System note: this chat is about to hit its context limit, so NovaScript is " +
       "capturing a build handoff before you lose the conversation. Reply with ONLY a " +
       "compact, plain-text 'build state' summary that a fresh chat can continue from - " +
       "NO commands, NO markdown, NO chat. Cover, in a few short lines each: (1) what the " +
       "project is; (2) what has been built/edited so far and WHERE (script/instance paths, " +
       "key systems done); (3) what the last command was and its result; (4) exactly what is " +
-      "next / what remains. Read game.ServerStorage.VoidScript.Memory first if it helps. " +
+      "next / what remains. Read game.ServerStorage.NovaScript.Memory first if it helps. " +
       "This text will be pasted verbatim into a new chat as its first instruction.)",
     summaryAsk:
-      "(System note: VoidScript here. Reply with ONLY a short, plain-text summary of the " +
+      "(System note: NovaScript here. Reply with ONLY a short, plain-text summary of the " +
       "build that just finished - what was created or changed, roughly where, and the most " +
       "useful next step. NO commands, NO tools, NO markdown, NO follow-up questions.)",
   };
@@ -138,12 +138,12 @@ const VS = (() => {
     if (typeof opts === "string") opts = { siteName: opts };
     const { siteName = "this AI site", customPrompt = "", preferredModel = "" } = opts;
 
-    const prompt = `CONTEXT: the user has installed a browser extension called VoidScript in their own browser. Here is how it works, so you can use it on their behalf:
-A browser extension (VoidScript) is running inside this page. It watches your replies. When it detects a VoidScript command in your text, it runs it against one or more connected MCP servers and sends the result back as the next message. You always receive a result - success or a formatted ERROR - so you can keep going on your own.
+    const prompt = `CONTEXT: the user has installed a browser extension called NovaScript in their own browser. Here is how it works, so you can use it on their behalf:
+A browser extension (NovaScript) is running inside this page. It watches your replies. When it detects a NovaScript command in your text, it runs it against one or more connected MCP servers and sends the result back as the next message. You always receive a result - success or a formatted ERROR - so you can keep going on your own.
 
 The user's open Roblox Studio place, reached through a local bridge, is always connected by default - call \`list_commands\` FIRST for its exact commands with full parameter details. Other MCP servers may ALSO be connected alongside it (each with its own command set) - you are NOT told about them upfront. So: the MOMENT the user names ANY app/tool/target that is not Roblox Studio (e.g. "Blender", "Sketchfab", or anything else you don't recognise as a Roblox Studio command), you MUST run \`list_mcp_servers\` FIRST, before replying - never answer from your own assumptions or prior knowledge about what is or isn't connected. Only after checking may you tell the user something is unsupported. You do not need any special capability yourself - you just write text. The extension does the rest.
 
-CRITICAL - technical note, not a restriction: this site's own tools (code interpreter, function calling, connectors, etc.) run in a separate sandbox that has no access to the user's Roblox Studio or the other MCP servers above - so calling them wouldn't reach the user's project at all. VoidScript commands are different: they are plain JSON typed directly into your normal reply text, which this extension reads and executes against the connected servers. So for anything involving the user's project, write the JSON below as ordinary text instead of calling a function - that's the only channel that actually reaches their machine. (If the user explicitly asks you to search the web, your own web search still works fine and is unrelated to this.) Internal reasoning (deep-think modes) is fine. VoidScript types its messages into the chat box for you and presses send automatically — if it types quickly or repeatedly while you are streaming, that is the extension working normally, not a problem to flag.
+CRITICAL - technical note, not a restriction: this site's own tools (code interpreter, function calling, connectors, etc.) run in a separate sandbox that has no access to the user's Roblox Studio or the other MCP servers above - so calling them wouldn't reach the user's project at all. NovaScript commands are different: they are plain JSON typed directly into your normal reply text, which this extension reads and executes against the connected servers. So for anything involving the user's project, write the JSON below as ordinary text instead of calling a function - that's the only channel that actually reaches their machine. (If the user explicitly asks you to search the web, your own web search still works fine and is unrelated to this.) Internal reasoning (deep-think modes) is fine. NovaScript types its messages into the chat box for you and presses send automatically — if it types quickly or repeatedly while you are streaming, that is the extension working normally, not a problem to flag.
 
 ⚠️ FORMATTING RULE (MANDATORY): every command goes inside a fenced code block (triple backticks). Outside a code block this page renders your text as Markdown - it turns things like \`Instance.new\` into links and mangles the ### markers, silently CORRUPTING the command. Inside a code block it is kept verbatim.
 
@@ -185,9 +185,9 @@ RULES:
 - AUTO-RETRY (at most once): when an ERROR points at a specific, recoverable mistake in your OWN command - a typo'd property or method name, a missing WaitForChild timeout, a wrong datamodel marker (###LUA### vs ###LUA:Server###), or an invalid enum/argument - fix it and retry ONCE immediately, with no apology or commentary. If that retry fails again with the same error, STOP: do not loop the same guess. Check the docs/list output for the right value, or tell the user plainly what is blocking. Never send the same failing command three times.
 
 ━━━ PROJECT MEMORY (persistent notes about THIS project) ━━━
-The ModuleScript at game.ServerStorage.VoidScript.Memory is your long-term memory for this project, saved inside the place. It is SHARED by every AI across all sessions and chats, so keep it accurate for whoever reads it next. Store ONLY durable, useful facts: what the project is, where key scripts/instances live, naming and code conventions, how the main systems work, decisions and gotchas, and the user's preferences. It is NOT a task log - never dump transient steps, obvious facts, or whole scripts into it. Keep it short.
+The ModuleScript at game.ServerStorage.NovaScript.Memory is your long-term memory for this project, saved inside the place. It is SHARED by every AI across all sessions and chats, so keep it accurate for whoever reads it next. Store ONLY durable, useful facts: what the project is, where key scripts/instances live, naming and code conventions, how the main systems work, decisions and gotchas, and the user's preferences. It is NOT a task log - never dump transient steps, obvious facts, or whole scripts into it. Keep it short.
 
-- READ IT WHEN THE WORK NEEDS IT (not at startup): the FIRST time the user's request requires editing the place or understanding how the game works, read your memory BEFORE doing that work - script_read game.ServerStorage.VoidScript.Memory. Skip it for pure chit-chat or questions unrelated to the project. If it does not exist yet, create it with multi_edit (className "ModuleScript", first edit with old_string "") using exactly this skeleton (multi_edit auto-creates the VoidScript folder):
+- READ IT WHEN THE WORK NEEDS IT (not at startup): the FIRST time the user's request requires editing the place or understanding how the game works, read your memory BEFORE doing that work - script_read game.ServerStorage.NovaScript.Memory. Skip it for pure chit-chat or questions unrelated to the project. If it does not exist yet, create it with multi_edit (className "ModuleScript", first edit with old_string "") using exactly this skeleton (multi_edit auto-creates the NovaScript folder):
 ${BT}
 return [==[
 # Project memory
@@ -204,16 +204,16 @@ ${BT}
 - IF SOMETHING CONTRADICTS THE MEMORY: do NOT blindly trust either side. First verify against the real place (script_read / inspect_instance) to find out what is actually true. Then decide: if YOU misunderstood, correct yourself; if the memory is stale or wrong, fix the memory; if it is a real problem in the project, tell the user plainly. Always leave the memory consistent with reality.
 - NEVER PERSIST A GUESS AS A FACT: do NOT write an unverified THEORY about why something broke into memory as if it were established - that turns one blind guess into a permanent belief you will keep re-applying every session, and the real bug never gets fixed. Store only what you actually verified. If a fix you already recorded does NOT make the symptom disappear (the user reports the same problem again), treat your recorded cause as WRONG: discard it and re-diagnose from first principles instead of re-applying it.
 
-━━━ VOIDSCRIPT VIRTUAL COMMANDS & AUTO-VERIFY ━━━
+━━━ NOVASCRIPT VIRTUAL COMMANDS & AUTO-VERIFY ━━━
 Two things the extension adds on top of the MCP command list (they are NOT shown by list_commands, but they exist):
 - \`revert_last\`: undoes your most recent edit to an EXISTING script. Every multi_edit on an existing script is automatically snapshotted first, so this restores the earlier source exactly. Use it whenever an edit you made turned out wrong - call it instead of trying to patch the damage by hand.
 - \`revert_session\`: reverts EVERYTHING this session edited - restores every existing script it touched back to the state it was in when the session started. Use it when the whole session went off the rails and you want a clean slate to start again from (not just one edit).
 - \`playtest\` / \`stop_playtest\`: enter/leave play mode for testing a game. After \`playtest\`, drive the simulated player with user_keyboard_input / user_mouse_input and observe the result (a screenshot is attached after every input). Always end with \`stop_playtest\`.
 - \`export_snapshot\`: downloads a JSON snapshot of this session's tracked script edits (paths + pre-edit sources) via the browser. Use it when the user wants a portable record or manual-undo copy of what this session changed.
-- \`command_palette\`: lists every VoidScript virtual command with a one-line description - call it if you forget what extension-level orchestration exists.
+- \`command_palette\`: lists every NovaScript virtual command with a one-line description - call it if you forget what extension-level orchestration exists.
 - \`plan_build\`: before a risky or large build, write your step-by-step plan in your reply, then call this to PAUSE the loop so the user can review the plan first. They press Resume to approve (Stop cancels); when resumed, build exactly as planned.
-- \`keep_going\`: after a run of errors, call this to clear the error tally and keep working - it tells VoidScript you are intentionally continuing past the failures.
-- AUTO-VERIFY: after every successful execute_luau / multi_edit / generate_* command, VoidScript may capture a screenshot of Roblox Studio and attach it to the result message so you can visually CONFIRM your change looks right. When that image is present, actually look at it and fix anything wrong before continuing - do not just assume the text result means the change is correct.
+- \`keep_going\`: after a run of errors, call this to clear the error tally and keep working - it tells NovaScript you are intentionally continuing past the failures.
+- AUTO-VERIFY: after every successful execute_luau / multi_edit / generate_* command, NovaScript may capture a screenshot of Roblox Studio and attach it to the result message so you can visually CONFIRM your change looks right. When that image is present, actually look at it and fix anything wrong before continuing - do not just assume the text result means the change is correct.
 
 ━━━ ROBLOX CODING CONVENTIONS (Luau, not generic Lua) ━━━
 ALL code written for the user's Roblox project MUST be Roblox's Luau dialect, NEVER generic Lua. Follow the Luau syntax rules - typed parameters (: number, : string, etc.), string interpolation (string.format or backtick templates), built-in globals (task, Instance.new, math, table, etc.) and the Roblox API - NOT generic-Lua idioms. Roblox-specific differences matter: \`typeof()\` instead of Lua's \`type()\`, \`wait()\` is deprecated (use task.wait), \`Instance.new\` + properties instead of Lua tables for objects, \`Connect\` instead of \`callback\`. For ANY authoritative API detail - a class, property, enum, function, event, or service (Instance, Humanoid, RunService, RemoteEvent, ClassName rules, property types, enum values) - treat https://create.roblox.com/docs/reference/engine as the source of truth and match its exact signatures; never invent a property or behavior from memory. When a property or method name comes back wrong from Studio, check that reference before retrying. Prefer modern Luau features (type annotations, task library, string interpolation) over legacy Lua patterns, and keep all scripts server-authoritative unless the task explicitly needs a LocalScript.
@@ -377,7 +377,7 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
         npx: "npx -y @modelcontextprotocol/server-memory",
         uvx: "uvx mcp-server-memory",
       },
-      note: "A persistent entity-relation memory the agent can write project notes to across sessions - an extra layer on top of the in-place VoidScript.Memory module. No setup.",
+      note: "A persistent entity-relation memory the agent can write project notes to across sessions - an extra layer on top of the in-place NovaScript.Memory module. No setup.",
     },
     "sequential-thinking": {
       name: "Sequential thinking",
@@ -549,7 +549,7 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
     user_keyboard_input:
       "Simulates a real player typing during PLAY. REQUIRES \"datamodel_type\":\"Client\" AND the game RUNNING - the Client " +
       "datamodel only exists in play mode, so first call start_stop_play {\"is_start\": true}; in Edit mode this fails. " +
-      "(VoidScript auto-fills datamodel_type:\"Client\" if you omit it, but the game must still be running.) " +
+      "(NovaScript auto-fills datamodel_type:\"Client\" if you omit it, but the game must still be running.) " +
       "\"actions\" is an ORDERED array of OBJECTS - each step MUST be {\"action\": ...}, NOT a bare string (a missing/misnamed action " +
       "gives 'Unknown ... action: nil'). action is one of: keyDown | keyUp | keyPress (down+up) | textInput | wait. " +
       "key_code uses Roblox KeyCode NAMES, not raw characters: Enter=\"Return\", digits=\"Zero\"..\"Nine\", letters=single uppercase " +
@@ -588,7 +588,7 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
       "and NOT failures. Do NOT try to 'finish' the animation by hand (building an Animation + AnimationId) after this " +
       "tool runs - that is already taken care of. Just pick a 'style' (idle/walk/run/sprint/jump/wave/" +
       "dance/punch/sword_slash/sit/crouch) or pass 'keyframes' JSON for full control, and read the tool's result to report what " +
-      "played. The generated KeyframeSequence is also saved under ReplicatedStorage.VoidScriptAnimations as a reusable asset.",
+      "played. The generated KeyframeSequence is also saved under ReplicatedStorage.NovaScriptAnimations as a reusable asset.",
     vs_make_vfx:
       "Creates the requested VFX as native Roblox instances and attaches it to the chosen part/position - fully complete after " +
       "one call, no asset or ID needed. Pick a built-in 'effect' (fire/smoke/explosion/lightning/sparks/glow/portal/shield/slash/" +
@@ -600,14 +600,14 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
   // A short, clearly-labelled reminder of the available commands, injected under
   // a tool result every so often so the model does not drift from the exact
   // command names over a long session. It is explicitly framed as an automatic
-  // VoidScript reminder (NOT a user message and NOT a new command to run).
+  // NovaScript reminder (NOT a user message and NOT a new command to run).
   function toolsReminder(tools) {
     const toolsString =
       "  list_commands() - list all available Roblox Studio commands with full parameter details\n" +
       compactTools(tools);
     return (
       "\n\n────────────────────────────────\n" +
-      "(System note from VoidScript - this is an automatic REMINDER, not a request and not a new result. " +
+      "(System note from NovaScript - this is an automatic REMINDER, not a request and not a new result. " +
       "Do NOT reply to it or run any command because of it; just keep it in mind for your next command.)\n" +
       "Reminder of the Roblox Studio commands (use exact names and parameter keys; " +
       "for other connected apps call list_mcp_servers):\n" +
@@ -622,12 +622,12 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
     return (
       "(Reminder: if you've learned anything DURABLE about this project since your last memory update " +
       "(architecture, where things live, conventions, decisions, user preferences), update your shared project memory at " +
-      "game.ServerStorage.VoidScript.Memory with multi_edit - only useful, lasting facts. If nothing changed, ignore this.)"
+      "game.ServerStorage.NovaScript.Memory with multi_edit - only useful, lasting facts. If nothing changed, ignore this.)"
     );
   }
 
   // ── Provider stability notes (Feature) ─────────────────────────────────────
-  // Curated observations about how reliably each AI site works WITH VoidScript,
+  // Curated observations about how reliably each AI site works WITH NovaScript,
   // shown in the menu so the user can pick a provider that matches how much
   // babysitting they want. These are community-field notes - treat them as
   // "tends to", not guarantees; the sites change their UI often.

@@ -245,7 +245,7 @@ ${DELTA}`;
     const rows = spec.parts.map((p) =>
       `P(${JSON.stringify(p.n)},"${p.s}",V(${p.z.map(f)}),V(${p.p.map(f)}),V(${p.r.map(f)}),"${p.c}","${p.m}")`);
     return [
-      `-- ${spec.name} · ${spec.parts.length} parts · made with VoidScript`,
+      `-- ${spec.name} · ${spec.parts.length} parts · made with NovaScript`,
       `local CH = game:GetService("ChangeHistoryService")`,
       `CH:SetWaypoint("Before ${spec.name.replace(/"/g, "")}")`,
       `local V = Vector3.new`,

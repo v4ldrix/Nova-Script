@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "VoidScript Free × Roblox Studio Agent",
+  "name": "NovaScript Free × Roblox Studio Agent",
   "version": "6.1.0",
   "description": "Turn 99 AI sites - DeepSeek, Gemini, Kimi.ai, GLM, Qwen, Arena, Meta AI, ChatGPT, Claude, Grok, Perplexity, Copilot, Mistral, T3 Chat, Poolside, Twinny, Cody, Chatbase and more - into a Roblox Studio agent that drives Studio through a local bridge.",
   "permissions": ["storage", "notifications"],
@@ -103,7 +103,7 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "voidscript@voidscript.local",
+      "id": "novascript@novascript.local",
       "strict_min_version": "121.0"
     }
   },
@@ -114,7 +114,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "VoidScript Free",
+    "default_title": "NovaScript Free",
     "default_icon": {
       "16": "icon.png",
       "48": "icon.png",

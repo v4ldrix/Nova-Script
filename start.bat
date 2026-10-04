@@ -1,12 +1,12 @@
 :: SPDX-License-Identifier: GPL-3.0-or-later
-:: VoidScript launcher (Windows). Finds a usable Python, makes sure the
+:: NovaScript launcher (Windows). Finds a usable Python, makes sure the
 :: `websockets` dependency is present, frees the bridge port if a previous run
-:: left it held, then runs bridge.py. Written for VoidScript; kept GPL-3.0 as
+:: left it held, then runs bridge.py. Written for NovaScript; kept GPL-3.0 as
 :: part of the project.
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title VoidScript Bridge  -  Roblox Studio agent
+title NovaScript Bridge  -  Roblox Studio agent
 cd /d "%~dp0"
 
 :: ---- palette ---------------------------------------------------------------
@@ -111,7 +111,7 @@ if not defined SKIP_UPDATE (
                 echo   Reload the extension at chrome://extensions after this restarts.
                 call :note "auto-update applied: !UPAUTO!"
                 echo.
-                echo   %CVIO%Restarting VoidScript with the new version...%C0%
+                echo   %CVIO%Restarting NovaScript with the new version...%C0%
                 :: Restart-loop guard: count consecutive auto-restarts. If the new
                 :: window somehow re-triggers an update anyway, stop after 3
                 :: instead of opening a window per restart forever.
@@ -124,15 +124,15 @@ if not defined SKIP_UPDATE (
                     echo.
                     echo   %CRED%ERROR:%C0% Auto-update kept restarting (!RESTART_COUNT!x^) - stopping to
                     echo   avoid an endless loop. Run start.bat again in a minute, or check the
-                    echo   Void-Script releases on GitHub for a broken update.
+                    echo   Nova-Script releases on GitHub for a broken update.
                     call :note "ABORT: update restart loop detected (!RESTART_COUNT! restarts)."
                     if not defined VS_GUI pause >nul
                     exit /b 1
                 )
-                rem Under the VoidScript app, hand the restart back to the app: exit
+                rem Under the NovaScript app, hand the restart back to the app: exit
                 rem code 99 means "update installed", and the app relaunches the bridge.
                 if defined VS_GUI exit /b 99
-                start "VoidScript Update" /d "%~dp0" cmd /c ""%~f0" --skip-update"
+                start "NovaScript Update" /d "%~dp0" cmd /c ""%~f0" --skip-update"
                 exit /b 0
             )
         )
@@ -216,7 +216,7 @@ exit /b 1
 :: re-run of this launcher finds it). Requires an internet connection.
 :install_python_direct
 set "PY_URL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
-set "PY_INST=%TEMP%\voidscript-python-setup.exe"
+set "PY_INST=%TEMP%\novascript-python-setup.exe"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PY_URL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-arm64.exe"
 echo         Downloading the Python installer...
 curl.exe -L --fail --silent --show-error -o "%PY_INST%" "%PY_URL%" || (
@@ -253,7 +253,7 @@ echo         %CWARN%A previous bridge (pid !HOLDER!) is on port %PORT% - replaci
 call :note "killing leftover bridge pid !HOLDER! on port %PORT%."
 taskkill /F /T /PID !HOLDER! >nul 2>nul
 rem ~1s pause for the port to free up. Not "timeout": it refuses to run without
-rem console input, which is exactly how the VoidScript app launches this script.
+rem console input, which is exactly how the NovaScript app launches this script.
 ping -n 2 127.0.0.1 >nul
 set "HOLDER="
 for /f "tokens=5" %%p in ('netstat -aon ^| findstr :%PORT% ^| findstr LISTENING 2^>nul') do set "HOLDER=%%p"
@@ -282,7 +282,7 @@ echo  %CRED%##############################################################%C0%
 echo  %CRED%##%C0%                                                          %CRED%##%C0%
 echo  %CRED%##%C0%   %CB%%CWHT%KEEP THIS WINDOW OPEN%C0% %CDIM%-%C0% %CRED%DO NOT CLOSE IT%C0%                %CRED%##%C0%
 echo  %CRED%##%C0%                                                          %CRED%##%C0%
-echo  %CRED%##%C0%   %CDIM%VoidScript stops the moment this closes. Just%C0%          %CRED%##%C0%
+echo  %CRED%##%C0%   %CDIM%NovaScript stops the moment this closes. Just%C0%          %CRED%##%C0%
 echo  %CRED%##%C0%   %CDIM%minimize it and leave it running in the background.%C0%    %CRED%##%C0%
 echo  %CRED%##%C0%                                                          %CRED%##%C0%
 echo  %CRED%##############################################################%C0%
@@ -303,7 +303,7 @@ exit /b 0
 
 :: :halt <code>  - pause so the window stays readable, then exit with <code>.
 :halt
-rem Under VoidScript.exe (VS_GUI) there is no visible console to press a key in;
+rem Under NovaScript.exe (VS_GUI) there is no visible console to press a key in;
 rem the app shows the error and its own close button instead.
 if defined VS_GUI exit /b %~1
 echo   Press any key to close.

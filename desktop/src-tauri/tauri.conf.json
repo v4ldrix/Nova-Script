@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "VoidScript",
+  "productName": "NovaScript",
   "version": "6.1.0",
-  "identifier": "app.voidscript.desktop",
+  "identifier": "app.novascript.desktop",
   "build": {
     "frontendDist": "../ui"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "VoidScript",
+        "title": "NovaScript",
         "width": 1180,
         "height": 760,
         "minWidth": 900,
@@ -34,9 +34,9 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "publisher": "VoidScript",
+    "publisher": "NovaScript",
     "shortDescription": "AI agent for Roblox Studio",
-    "longDescription": "VoidScript runs the local bridge that lets AI build in Roblox Studio, with a built-in chat, tools terminal and live Studio status.",
+    "longDescription": "NovaScript runs the local bridge that lets AI build in Roblox Studio, with a built-in chat, tools terminal and live Studio status.",
     "copyright": "GPL-3.0-or-later"
   }
 }

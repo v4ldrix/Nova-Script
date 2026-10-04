@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Inside ui-view.html: previews whatever ScreenGui the VoidScript panel posts.
+// Inside ui-view.html: previews whatever ScreenGui the NovaScript panel posts.
 "use strict";
 window.addEventListener("message", (e) => {
   const d = e.data || {};

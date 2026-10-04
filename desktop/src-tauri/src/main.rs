@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// VoidScript Desktop - the app that runs the Roblox Studio bridge, shows its live
+// NovaScript Desktop - the app that runs the Roblox Studio bridge, shows its live
 // status, lists every tool, and hosts a built-in AI chat (NVIDIA API) that builds
 // in Studio through the bridge. Optional, off-by-default workspace access lets the
 // AI read/write files and run commands inside ONE folder the user picks.
@@ -188,7 +188,7 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-// The app sits in the VoidScript folder next to start.bat. During development it
+// The app sits in the NovaScript folder next to start.bat. During development it
 // runs from desktop/src-tauri/target/..., so walk up a few levels to find it.
 fn find_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -307,7 +307,7 @@ fn start_bridge_proc(app: &AppHandle, args: &str) -> Result<(), String> {
         Some(r) => r,
         None => {
             set_process(app, "missing", None);
-            return Err("VoidScript.exe must sit in the VoidScript folder, next to start.bat.".into());
+            return Err("NovaScript.exe must sit in the NovaScript folder, next to start.bat.".into());
         }
     };
     if st.bridge_pid.lock().unwrap().is_some() {
@@ -337,7 +337,7 @@ fn start_bridge_proc(app: &AppHandle, args: &str) -> Result<(), String> {
     let mut child = cmd.spawn().map_err(|e| format!("could not start the bridge: {e}"))?;
     *st.bridge_pid.lock().unwrap() = Some(child.id());
     set_process(app, "starting", None);
-    push_log(app, format!("── starting VoidScript bridge ({}) ──", display_path(&root)), "acc");
+    push_log(app, format!("── starting NovaScript bridge ({}) ──", display_path(&root)), "acc");
 
     for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
                    child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
@@ -515,7 +515,7 @@ fn start_dir(st: &AppState) -> Result<PathBuf, String> {
 fn workspace_base(st: &AppState) -> Result<PathBuf, String> {
     let s = st.settings.lock().unwrap();
     if !s.workspace_enabled || s.workspace_dir.trim().is_empty() {
-        return Err("Workspace access is off. Turn it on in VoidScript → Settings → Workspace access.".into());
+        return Err("Workspace access is off. Turn it on in NovaScript → Settings → Workspace access.".into());
     }
     std::fs::canonicalize(&s.workspace_dir).map_err(|e| format!("The workspace folder is unavailable: {e}"))
 }
@@ -629,7 +629,7 @@ fn save_settings(st: State<'_, AppState>, patch: Value) -> Result<SettingsView, 
 async fn pick_workspace(app: AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = oneshot::channel();
-    app.dialog().file().set_title("Choose the workspace folder VoidScript may use").pick_folder(move |f| {
+    app.dialog().file().set_title("Choose the workspace folder NovaScript may use").pick_folder(move |f| {
         let _ = tx.send(f.and_then(|p| p.into_path().ok()).map(|p| display_path(&p)));
     });
     rx.await.ok().flatten()
@@ -660,8 +660,8 @@ fn open_folder(app: AppHandle, st: State<'_, AppState>, which: String) -> Result
     use tauri_plugin_opener::OpenerExt;
     let p = match which.as_str() {
         "workspace" => workspace_base(&st)?,
-        "logs" => st.root.clone().ok_or("VoidScript folder not found")?.join("logs"),
-        _ => st.root.clone().ok_or("VoidScript folder not found")?,
+        "logs" => st.root.clone().ok_or("NovaScript folder not found")?.join("logs"),
+        _ => st.root.clone().ok_or("NovaScript folder not found")?,
     };
     app.opener().open_path(display_path(&p), None::<&str>).map_err(|e| e.to_string())
 }
@@ -671,7 +671,7 @@ fn open_folder(app: AppHandle, st: State<'_, AppState>, which: String) -> Result
 // "roblox" is the primary server and is never edited here.
 
 fn mcp_config_path(st: &AppState) -> Result<PathBuf, String> {
-    Ok(st.root.clone().ok_or("VoidScript folder not found")?.join("config.json"))
+    Ok(st.root.clone().ok_or("NovaScript folder not found")?.join("config.json"))
 }
 
 fn read_mcp_config(path: &Path) -> Value {
@@ -756,7 +756,7 @@ fn provider_for(st: &AppState, which: Option<&str>) -> Result<Provider, String> 
 fn with_headers(p: &Provider, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let rb = rb.bearer_auth(&p.key);
     // OpenRouter's (optional) app attribution headers.
-    if p.openrouter { rb.header("HTTP-Referer", "https://voidstudioai.netlify.app").header("X-Title", "VoidScript") } else { rb }
+    if p.openrouter { rb.header("HTTP-Referer", "https://voidstudioai.netlify.app").header("X-Title", "NovaScript") } else { rb }
 }
 
 const NON_CHAT: &[&str] = &[
@@ -1054,7 +1054,7 @@ fn show_main(app: &AppHandle) {
 // The app checks GitHub itself and drives update.py (the same updater start.bat
 // uses), then reopens on the new version.
 
-const RELEASES_API: &str = "https://api.github.com/repos/cjl26rg2/Void-Script/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/v4ldrix/Nova-Script/releases/latest";
 
 fn version_parts(v: &str) -> Vec<u64> {
     v.trim().trim_start_matches(['v', 'V']).split(|c: char| !c.is_ascii_digit())
@@ -1081,7 +1081,7 @@ async fn check_update(app: AppHandle, st: State<'_, AppState>) -> Result<Value, 
 // Run update.py with whichever Python start.bat would find, streaming its log.
 fn run_updater(app: &AppHandle, root: &Path) -> Result<String, String> {
     let script = root.join("update.py");
-    if !script.is_file() { return Err("update.py is missing from the VoidScript folder.".into()); }
+    if !script.is_file() { return Err("update.py is missing from the NovaScript folder.".into()); }
     let mut last_err = String::from("Python was not found. Run start.bat once so it can set Python up, then try again.");
     for (exe, pre) in [("py", vec!["-3"]), ("python", vec![])] {
         let mut c = Command::new(exe);
@@ -1113,7 +1113,7 @@ fn run_updater(app: &AppHandle, root: &Path) -> Result<String, String> {
 
 #[tauri::command]
 async fn run_update(app: AppHandle) -> Result<String, String> {
-    let root = app.state::<AppState>().root.clone().ok_or("VoidScript folder not found")?;
+    let root = app.state::<AppState>().root.clone().ok_or("NovaScript folder not found")?;
     stop_bridge_proc(&app);
     let app2 = app.clone();
     let root2 = root.clone();
@@ -1130,8 +1130,8 @@ async fn run_update(app: AppHandle) -> Result<String, String> {
 // Reopen on the (new) exe. A short delay lets this instance - and its
 // single-instance lock - go away first, or the new one would just focus us.
 fn relaunch_proc(app: &AppHandle, root: &Path) -> Result<(), String> {
-    let exe = Some(root.join("VoidScript.exe")).filter(|p| p.is_file())
-        .or_else(|| std::env::current_exe().ok()).ok_or("cannot find VoidScript.exe")?;
+    let exe = Some(root.join("NovaScript.exe")).filter(|p| p.is_file())
+        .or_else(|| std::env::current_exe().ok()).ok_or("cannot find NovaScript.exe")?;
     let mut c = Command::new("cmd.exe");
     c.arg("/d").arg("/c");
     #[cfg(windows)]
@@ -1139,14 +1139,14 @@ fn relaunch_proc(app: &AppHandle, root: &Path) -> Result<(), String> {
     c.current_dir(root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     c.creation_flags(CREATE_NO_WINDOW | 0x0000_0008); // DETACHED_PROCESS
-    c.spawn().map_err(|e| format!("Updated, but could not reopen VoidScript: {e}"))?;
+    c.spawn().map_err(|e| format!("Updated, but could not reopen NovaScript: {e}"))?;
     quit(app);
     Ok(())
 }
 
 #[tauri::command]
 fn relaunch(app: AppHandle) -> Result<(), String> {
-    let root = app.state::<AppState>().root.clone().ok_or("VoidScript folder not found")?;
+    let root = app.state::<AppState>().root.clone().ok_or("NovaScript folder not found")?;
     relaunch_proc(&app, &root)
 }
 
@@ -1165,7 +1165,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let settings_path = app.path().app_config_dir().map(|d| d.join("settings.json"))
-                .unwrap_or_else(|_| PathBuf::from("voidscript-settings.json"));
+                .unwrap_or_else(|_| PathBuf::from("novascript-settings.json"));
             let settings = load_settings(&settings_path);
             let auto = settings.auto_start_bridge && settings.accepted_disclaimer;
             let bstate = BridgeState {
@@ -1185,14 +1185,14 @@ fn main() {
                 ws_tx: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
-                http: reqwest::Client::builder().user_agent("VoidScript-Desktop").build().unwrap_or_default(),
+                http: reqwest::Client::builder().user_agent("NovaScript-Desktop").build().unwrap_or_default(),
                 chat_cancel: Mutex::new(None),
             });
 
-            let show = MenuItem::with_id(app, "show", "Open VoidScript", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit VoidScript", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "Open NovaScript", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit NovaScript", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit_i])?;
-            let mut tray = TrayIconBuilder::with_id("main").tooltip("VoidScript").menu(&menu)
+            let mut tray = TrayIconBuilder::with_id("main").tooltip("NovaScript").menu(&menu)
                 .on_menu_event(|app, e| match e.id.as_ref() {
                     "show" => show_main(app),
                     "quit" => quit(app),
@@ -1233,7 +1233,7 @@ fn main() {
             ws_list, ws_read, ws_write, ws_delete, ws_run, quit_app
         ])
         .build(tauri::generate_context!())
-        .expect("error while building VoidScript")
+        .expect("error while building NovaScript")
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 let st = app.state::<AppState>();

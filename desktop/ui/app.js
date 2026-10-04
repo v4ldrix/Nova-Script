@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// VoidScript Desktop UI. Talks only to the Rust backend (window.__TAURI__): the
+// NovaScript Desktop UI. Talks only to the Rust backend (window.__TAURI__): the
 // backend owns the bridge process, the bridge connection, the NVIDIA key and the
 // workspace jail. Model output is always rendered as escaped text.
 "use strict";
@@ -70,7 +70,7 @@ document.addEventListener("click", (e) => {
 // ── status rendering ────────────────────────────────────────────────────────
 function bridgeInfo(st) {
   const p = st.process;
-  if (p === "missing") return { cls: "bad", pill: "missing", big: "Folder not found", small: "Put VoidScript.exe in the VoidScript folder, next to start.bat." };
+  if (p === "missing") return { cls: "bad", pill: "missing", big: "Folder not found", small: "Put NovaScript.exe in the NovaScript folder, next to start.bat." };
   if (p === "updating") return { cls: "acc", pill: "updating", big: "Updating…", small: "Installing the new version." };
   if (st.connected && (p === "stopped" || p === "error")) return { cls: "ok", pill: "on", big: "Running", small: "Started outside this app (start.bat)." };
   if (p === "error") return { cls: "bad", pill: "error", big: "Stopped", small: "It stopped with an error — check the Terminal." };
@@ -396,7 +396,7 @@ async function checkUpdate(manual) {
   // Notes usually open with the release title again - the card already shows it.
   const notes = String(upd.notes || "").replace(/\r/g, "").replace(/^\s*#{1,6}\s*([^\n]*)\n?/, (m, t) => (upd.name && t.trim() === String(upd.name).trim() ? "" : m));
   $("upd-notes").innerHTML = notesHtml(notes);
-  if (upd.newer) notify("update", `Update available: ${upd.latest}`, "Open Updates to install it. VoidScript reopens by itself.", { key: "update-" + upd.latest, go: "updates" });
+  if (upd.newer) notify("update", `Update available: ${upd.latest}`, "Open Updates to install it. NovaScript reopens by itself.", { key: "update-" + upd.latest, go: "updates" });
   else if (manual) toast("You're on the latest version.");
 }
 $("btn-upd-check").onclick = () => checkUpdate(true);
@@ -405,7 +405,7 @@ $("btn-upd-go").onclick = async () => {
   if (chat.busy) { toast("Stop the chat first, then update."); return; }
   $("updating").hidden = false;
   $("updating-fail").hidden = true;
-  $("updating-title").textContent = "VoidScript is currently updating";
+  $("updating-title").textContent = "NovaScript is currently updating";
   $("updating-line").textContent = "Getting the new version…";
   try {
     const r = await invoke("run_update");
@@ -413,7 +413,7 @@ $("btn-upd-go").onclick = async () => {
       // The folder already has the new release (e.g. start.bat updated it) but this
       // running app is the old exe - reopen on the new one instead of doing nothing.
       if (upd && upd.newer) {
-        $("updating-line").textContent = "Already downloaded. Reopening VoidScript…";
+        $("updating-line").textContent = "Already downloaded. Reopening NovaScript…";
         await invoke("relaunch");
         return;
       }
@@ -1013,7 +1013,7 @@ function renderSettings() {
   $("set-tray").checked = s.close_to_tray !== false;
   applyTheme(s.theme);
   $("chat-empty-sub").textContent = keySet()
-    ? "Describe a feature and VoidScript builds it in your open Studio place. Attach reference files with the paperclip."
+    ? "Describe a feature and NovaScript builds it in your open Studio place. Attach reference files with the paperclip."
     : `This chat runs on your own API key. Add your ${PROV_NAME[p]} key in Settings, or use the browser extension for ChatGPT, Gemini, DeepSeek and more.`;
 }
 async function saveSettings(patch, msg) {
@@ -1204,7 +1204,7 @@ $("set-sounds-vol").addEventListener("change", () => { sound.vol = Number($("set
 $("btn-sound-test").onclick = () => sfx("done", true);
 renderSound();
 
-// Theme: "or" is the partner look; anything else is VoidScript's own.
+// Theme: "or" is the partner look; anything else is NovaScript's own.
 function applyTheme(t) {
   const or = t === "or";
   if (or) document.documentElement.setAttribute("data-theme", "or");
@@ -1257,13 +1257,13 @@ function approve(kind, label, title, detail, opts = {}) {
 const chat = { messages: [], busy: false, stop: false };
 const body = $("chat-body");
 
-// Project memory: the same ServerStorage.VoidScript.Memory ModuleScript the browser
+// Project memory: the same ServerStorage.NovaScript.Memory ModuleScript the browser
 // extension keeps, so every AI that works on a game shares one memory of it.
-const MEM_PATH = "game.ServerStorage.VoidScript.Memory";
+const MEM_PATH = "game.ServerStorage.NovaScript.Memory";
 const MEM_SKELETON = "return [==[\n# Project memory\n## Overview\n## Where things live\n## Conventions\n## Key systems\n## Decisions & gotchas\n## User preferences\n## Open questions / TODO\n]==]";
 async function readMemory() {
   if (!S.state.connected || !(S.state.tools || []).some((t) => t.name === "execute_luau")) return null;
-  const code = 'local f = game:GetService("ServerStorage"):FindFirstChild("VoidScript")\n' +
+  const code = 'local f = game:GetService("ServerStorage"):FindFirstChild("NovaScript")\n' +
     'local m = f and f:FindFirstChild("Memory")\nreturn m and m:IsA("ModuleScript") and m.Source or ""';
   try {
     const r = await invoke("bridge_request", { payload: { type: "call_tool", name: "execute_luau", arguments: { code, datamodel_type: "Edit" } }, timeoutMs: 15000 });
@@ -1285,7 +1285,7 @@ function systemPrompt(opts = {}) {
   const st = S.state || {};
   const ws = filesOn();
   const lines = [
-    "You are VoidScript, an AI teammate that builds Roblox games directly inside the user's open Roblox Studio using the tools provided. The tools run live against Studio through the local VoidScript bridge.",
+    "You are NovaScript, an AI teammate that builds Roblox games directly inside the user's open Roblox Studio using the tools provided. The tools run live against Studio through the local NovaScript bridge.",
     "",
     "How to work:",
     "- Act with tools instead of describing steps. The user cannot paste code into Studio for you - only your tool calls change the game.",
@@ -1297,7 +1297,7 @@ function systemPrompt(opts = {}) {
     "- When a tool returns an error, read it and fix your call once. Do not repeat the same failing call.",
     "- Keep replies short and natural, like a friendly Roblox dev. When you finish, say what you built in a sentence or two.",
   ];
-  if (!st.connected) lines.push("", "The Roblox Studio bridge is offline right now, so the Studio tools are unavailable. If the user asks you to build, tell them to start the bridge on the VoidScript Home tab and open Roblox Studio.");
+  if (!st.connected) lines.push("", "The Roblox Studio bridge is offline right now, so the Studio tools are unavailable. If the user asks you to build, tell them to start the bridge on the NovaScript Home tab and open Roblox Studio.");
   if (ws && access() === "full") lines.push("", `You also have workspace_* tools with access to the user's whole PC. Use absolute Windows paths (C:\\...) or paths relative to ${s.workspace_dir || "the user's home folder"}. Deletes need the user's approval. Don't touch system folders or files the user didn't mention.`);
   else if (ws) lines.push("", `You also have workspace_* tools for files in the user's chosen folder (${s.workspace_dir}). Paths are relative to that folder and you cannot leave it.${access() === "ask" ? " The user approves every write, delete and command, so say briefly why before each one." : " Deletes need the user's approval."}`);
   if (mode.memory && st.connected) lines.push(...memoryLines());
@@ -1792,7 +1792,7 @@ document.querySelectorAll(".sugg").forEach((b) => b.addEventListener("click", ()
   // start.bat's own auto-update already swapped the files in: reopen on the new app.
   await listen("bridge-updated", () => {
     $("updating").hidden = false;
-    $("updating-line").textContent = "Update installed. Reopening VoidScript…";
+    $("updating-line").textContent = "Update installed. Reopening NovaScript…";
     invoke("relaunch").catch(() => { $("updating").hidden = true; $("update-banner").hidden = false; });
   });
   if (!S.settings.accepted_disclaimer) $("disclaimer").hidden = false;

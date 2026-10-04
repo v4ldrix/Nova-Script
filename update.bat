@@ -1,11 +1,11 @@
 :: SPDX-License-Identifier: GPL-3.0-or-later
-:: VoidScript updater (Windows). Double-click to check for and apply the latest
+:: NovaScript updater (Windows). Double-click to check for and apply the latest
 :: GitHub release. Finds a usable Python (same logic as start.bat), runs
 :: update.py, then pauses so you can read the result.
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title VoidScript Updater
+title NovaScript Updater
 cd /d "%~dp0"
 
 :: ---- palette ---------------------------------------------------------------

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // core/main.js - the provider-agnostic agentic loop, UI and session state.
 // Drives any AI chat site through the VSProvider interface (providers/*.js):
-// waits for the model's reply, parses VoidScript commands (VSParse), asks the
+// waits for the model's reply, parses NovaScript commands (VSParse), asks the
 // background worker to execute them on the Roblox MCP bridge, and feeds the
 // result back. Camouflages the system prompt ("Starting Up") and tool JSON
 // behind animated chips, masks injected input, and exposes a Stop button.
@@ -44,7 +44,7 @@
     if (document.hidden && vsOn("vsBackground")) return bgSleep(ms);
     return new Promise((r) => setTimeout(r, ms));
   };
-  const log = (...a) => console.log("[voidscript]", ...a);
+  const log = (...a) => console.log("[novascript]", ...a);
 
   // ── User settings (chrome.storage.local) ──────────────────────────────────
   // Newer features read their toggles from here so they can be switched off
@@ -235,7 +235,7 @@
   }
 
   // GitHub releases page - where users download the Bridge + start.bat.
-  const GITHUB_URL = "https://github.com/cjl26rg2/Void-Script";
+  const GITHUB_URL = "https://github.com/v4ldrix/Nova-Script";
   // Shown in the panel instead of a static "Free" label, so a user's screenshot
   // alone tells us which build they're on for debugging. Pulled from
   // manifest.json (single source of truth) rather than duplicated here.
@@ -244,8 +244,8 @@
   const VIDEO_URL = "https://youtu.be/kPKiZLZ9_Ps";
   // Work.ink locked link - free "watch an ad" support option. Set once the
   // locker is created at https://work.ink; the button is hidden until then.
-  const WORKINK_URL = "https://work.ink/2JXi/voidscript-free-roblox-ai-coding-tool";
-  // AI chat sites VoidScript works on. Keep in sync with manifest.json
+  const WORKINK_URL = "https://work.ink/2JXi/novascript-free-roblox-ai-coding-tool";
+  // AI chat sites NovaScript works on. Keep in sync with manifest.json
   // content_scripts and background.js PROVIDER_URLS when adding a provider.
   const AI_SITES = [
     { name: "DeepSeek", url: "https://chat.deepseek.com/" },
@@ -1385,7 +1385,7 @@
     try {
       buildSessionLogText().then((log) => {
         if (!log) return;
-        const header = `\n===== VoidScript session ${new Date().toLocaleString()} =====\n${summary || ""}\n`;
+        const header = `\n===== NovaScript session ${new Date().toLocaleString()} =====\n${summary || ""}\n`;
         chrome.runtime.sendMessage({ type: "write_log", text: header + log }).catch(() => {});
       });
     } catch {}
@@ -1395,7 +1395,7 @@
       const synth = window.speechSynthesis;
       if (!synth) return;
       const u = new SpeechSynthesisUtterance(
-        `VoidScript session complete. ${okCount} commands, ${errCount} errors.`);
+        `NovaScript session complete. ${okCount} commands, ${errCount} errors.`);
       u.volume = 0.8; u.rate = 1.05;
       synth.speak(u);
     } catch {}
@@ -1582,7 +1582,7 @@
       }
       return `ERROR: the '${bareName}' command timed out and is unavailable in this environment. Do NOT call it again - complete the task yourself using the other commands (execute_luau, multi_edit, etc.).`;
     }
-    // Virtual command: list the MCP server(s) VoidScript is currently connected
+    // Virtual command: list the MCP server(s) NovaScript is currently connected
     // to, with each one's REAL per-server health (from the bridge, never the
     // merged tool count - a dead server must not borrow another's numbers).
     if (name === "list_mcp_servers") {
@@ -1727,7 +1727,7 @@
     // later be re-applied elsewhere. Also reachable from the menu (Export).
     if (name === "export_snapshot") {
       const snap = {
-        tool: "voidscript-export-snapshot",
+        tool: "novascript-export-snapshot",
         exportedAt: new Date().toISOString(),
         provider: P.id,
         session: { ok: A.runOk || 0, err: A.runErr || 0, startedAt: A.startedAt || 0 },
@@ -1735,7 +1735,7 @@
         macros: Object.keys(_macros || {}),
       };
       const json = JSON.stringify(snap, null, 2);
-      try { downloadTextFile(`voidscript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, json); }
+      try { downloadTextFile(`novascript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, json); }
       catch { return "ERROR: could not download the snapshot file (browser blocked the download)."; }
       const n = snap.undoStack.length;
       diag("snapshot.export", { entries: n });
@@ -1743,7 +1743,7 @@
     }
     // Virtual command: command palette (Feature) - a compact index of the
     // extension's VIRTUAL commands (the ones that are NOT in the MCP tool list
-    // and do not show up in list_commands). Use it to discover what VoidScript
+    // and do not show up in list_commands). Use it to discover what NovaScript
     // can orchestrate without re-reading the full system prompt.
     if (name === "command_palette") {
       const entries = [
@@ -1759,7 +1759,7 @@
         ["keep_going", "resume working after a run of errors; continue past the last failure"],
         ["command_palette", "show this index of virtual commands"],
       ];
-      return "Output of 'command_palette':\nVoidScript virtual commands (not in list_commands):\n\n" +
+      return "Output of 'command_palette':\nNovaScript virtual commands (not in list_commands):\n\n" +
         entries.map(([n, d]) => `  ${n} - ${d}`).join("\n") +
         "\n\nCall any of these with {\"command\":\"<name>\",\"params\":{...}}. Everything else you need comes from the MCP tool list.";
     }
@@ -1771,7 +1771,7 @@
       A.paused = true;
       ui.toast("Building the plan – review, then press Start to run it.");
       diag("plan.paused", { planLen: text.length });
-      return "Output of 'plan_build':\nPlan mode entered - the plan is written in your message above this result, and VoidScript has PAUSED the loop. The user will review it and press Resume to approve the build (Stop cancels). When resumed, follow the plan exactly and build it step by step with the real commands.";
+      return "Output of 'plan_build':\nPlan mode entered - the plan is written in your message above this result, and NovaScript has PAUSED the loop. The user will review it and press Resume to approve the build (Stop cancels). When resumed, follow the plan exactly and build it step by step with the real commands.";
     }
     // Virtual command: keep-going (Feature). After a run of errors, the model can
     // call this to clear the accumulated error tally and keep working instead of
@@ -1787,7 +1787,7 @@
     // play mode, feeds the model a first screenshot, and instructs it to drive
     // the simulated player step by step (each input auto-captures the result).
     // `stop_playtest` leaves play mode. The actual play-driving is model-steered
-    // (only it knows the scenario); VoidScript provides the orchestration and
+    // (only it knows the scenario); NovaScript provides the orchestration and
     // the closed vision loop.
     if (name === "playtest") {
       const goal = (args && args.goal) || "";
@@ -1798,7 +1798,7 @@
       await sleep(2500); // let the game render before the first screenshot
       const shot = await runTool({ tool: "screen_capture", arguments: {} });
       const goalLine = goal ? ` The user wants to test: "${goal.trim()}".` : "";
-      return `Output of 'playtest':\nPlay mode is now ON.${goalLine} A screenshot of the running game is attached to this message - look at it, then drive the simulated player step by step with user_keyboard_input / user_mouse_input (datamodel_type:"Client" - auto-filled if omitted). After EVERY input VoidScript attaches a screenshot of the game so you can see the result; keep going until the scenario is covered. When done, call 'stop_playtest' to leave play mode, then fix anything the test revealed.`;
+      return `Output of 'playtest':\nPlay mode is now ON.${goalLine} A screenshot of the running game is attached to this message - look at it, then drive the simulated player step by step with user_keyboard_input / user_mouse_input (datamodel_type:"Client" - auto-filled if omitted). After EVERY input NovaScript attaches a screenshot of the game so you can see the result; keep going until the scenario is covered. When done, call 'stop_playtest' to leave play mode, then fix anything the test revealed.`;
     }
     if (name === "stop_playtest") {
       const stop = await runTool({ tool: "start_stop_play", arguments: { is_start: false } });
@@ -1846,7 +1846,7 @@
       const m = BROAD_DELETE_RE.exec(code);
       if (m) {
         diag("guard.blocked", { match: m[0].slice(0, 40) });
-        return `ERROR: this execute_luau appears to ${m[0].includes("ClearAllChildren") ? "clear ALL children of" : "destroy"} ${(m[1] || "a place")} - VoidScript blocks that by default to protect the user's place. Make the action EXACT: name the specific instance(s) you want to affect (do NOT act on a whole service or the game). If you need to clear a container, point at that one container and only it, and say so explicitly. Verify scope first with inspect_instance if you are unsure, then retry with a precise, limited call.`;
+        return `ERROR: this execute_luau appears to ${m[0].includes("ClearAllChildren") ? "clear ALL children of" : "destroy"} ${(m[1] || "a place")} - NovaScript blocks that by default to protect the user's place. Make the action EXACT: name the specific instance(s) you want to affect (do NOT act on a whole service or the game). If you need to clear a container, point at that one container and only it, and say so explicitly. Verify scope first with inspect_instance if you are unsure, then retry with a precise, limited call.`;
       }
     }
     // The Roblox MCP REQUIRES datamodel_type on execute_luau (enum Edit/Client/
@@ -1962,7 +1962,7 @@
         return `ERROR: '${bareName}' returned an image, but this assistant cannot see images. Do NOT call it again. Use a different command to get the information as text instead.`;
       }
       if (r.images && r.images.length) {
-        // Show the capture in a left-hand VoidScript popup (from the in-memory
+        // Show the capture in a left-hand NovaScript popup (from the in-memory
         // base64 - simple and reliable on every site; no DOM-embedded preview).
         ui.showImages(r.images, name);
         // Do NOT attach the image here: submitAndGetBase/typeAndSend types the
@@ -2128,7 +2128,7 @@
       const lead = label === "playtest-step"
         ? "screenshot of the game after your simulated input is attached - check what the player now sees; if the game state is wrong or broken, fix it before the next input."
         : "screenshot of Roblox Studio right after your edit is attached - confirm the result actually looks right; if anything looks wrong, fix it and retry before moving on.";
-      return `\n\n[Auto-verify] VoidScript captured a ${lead}`;
+      return `\n\n[Auto-verify] NovaScript captured a ${lead}`;
     }
     return "";
   }
@@ -2520,7 +2520,7 @@
           try {
             chrome.runtime.sendMessage({
               type: "notify",
-              title: "VoidScript session done",
+              title: "NovaScript session done",
               message: parts.join(" · "),
             }).catch(() => {});
           } catch {}
@@ -3089,7 +3089,7 @@
       }
 
       // 3. Assistant command turns → live loading while streaming, ✓ when done.
-      // ONLY in a real VoidScript session (started or bootstrapping). Without
+      // ONLY in a real NovaScript session (started or bootstrapping). Without
       // this gate, a plain never-started chat where the model merely EXPLAINS
       // the command format (a {"command":...} example in its answer) got the
       // example MASKED behind a tool chip - hiding genuine content the user
@@ -3482,7 +3482,7 @@
         <div id="vs-bar">
           <svg id="vs-mark" width="20" height="20" viewBox="0 0 128 128" aria-hidden="true" style="flex:0 0 auto;filter:drop-shadow(0 0 4px rgba(255,138,61,.55))"><defs><linearGradient id="vsmr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffd9c0"/><stop offset=".5" stop-color="#ff8a3d"/><stop offset="1" stop-color="#ff5c8a"/></linearGradient><radialGradient id="vsmv" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#0b0d13"/><stop offset=".7" stop-color="#131420"/><stop offset="1" stop-color="#241a28"/></radialGradient></defs><circle cx="64" cy="64" r="54" fill="url(#vsmv)"/><circle cx="64" cy="64" r="54" fill="none" stroke="url(#vsmr)" stroke-width="9"/><g stroke="url(#vsmr)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" fill="none"><polyline points="49,44 30,64 49,84"/><polyline points="79,44 98,64 79,84"/><line x1="71" y1="40" x2="57" y2="88"/></g></svg>
           <span id="vs-dot" class="off" title=""></span>
-          <span id="vs-brand">VoidScript <span class="vs-free">v${EXT_VERSION}</span></span>
+          <span id="vs-brand">NovaScript <span class="vs-free">v${EXT_VERSION}</span></span>
           <span id="vs-state"></span>
            <span id="vs-live"></span>
            <button id="vs-quick-shot" hidden aria-label="Screenshot Studio" title="Take a screenshot of Studio and inspect it"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 3 7.17 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.17L15 3H9zm3 14a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg></button>
@@ -3505,9 +3505,9 @@
             </div>
           </div>
           <a id="vs-discord" href="https://discord.gg/KmkCKwUbcX" target="_blank" rel="noopener" title="Need help? Join our Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
-           <button id="vs-voice" hidden aria-label="Speak to VoidScript" title="Speak to VoidScript (transcribes and inserts)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 0 0 2 0v-3.08A7 7 0 0 0 19 11z"/></svg></button>
+           <button id="vs-voice" hidden aria-label="Speak to NovaScript" title="Speak to NovaScript (transcribes and inserts)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 0 0 2 0v-3.08A7 7 0 0 0 19 11z"/></svg></button>
           <button id="vs-switch" aria-label="Switch AI and options" title="Switch AI, custom prompt, support"><span id="vs-switch-name"></span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>
-          <button id="vs-support" aria-label="Support VoidScript" title="Support VoidScript"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button>
+          <button id="vs-support" aria-label="Support NovaScript" title="Support NovaScript"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button>
         </div>
         <div id="vs-menu" hidden></div>
         ${P.unstableWarning ? `<button id="vs-unstable" aria-label="Provider may be unstable" hidden>⚠ unstable</button>` : ""}
@@ -3687,7 +3687,7 @@
           _recognition = null;
           if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
           voiceBtn.classList.remove("vs-voice-rec");
-          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          voiceBtn.title = "Speak to NovaScript (transcribes and inserts)";
           return;
         }
         try {
@@ -3704,7 +3704,7 @@
         voiceBtn.title = "Stop recording";
         _voiceTimer = setTimeout(() => {
           voiceBtn.classList.remove("vs-voice-rec");
-          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          voiceBtn.title = "Speak to NovaScript (transcribes and inserts)";
         }, 15000);
         _recognition.onresult = (ev) => {
           const t = (ev.results[ev.resultIndex] && ev.results[ev.resultIndex][0] && ev.results[ev.resultIndex][0].transcript) || "";
@@ -3720,7 +3720,7 @@
         _recognition.onerror = (ev) => {
           if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
           voiceBtn.classList.remove("vs-voice-rec");
-          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          voiceBtn.title = "Speak to NovaScript (transcribes and inserts)";
           _recognition = null;
           const msg = (ev && ev.error) || "unknown";
           if (msg === "not-allowed" || msg === "permission-denied") {
@@ -3732,7 +3732,7 @@
         _recognition.onend = () => {
           if (_voiceTimer) { clearTimeout(_voiceTimer); _voiceTimer = null; }
           voiceBtn.classList.remove("vs-voice-rec");
-          voiceBtn.title = "Speak to VoidScript (transcribes and inserts)";
+          voiceBtn.title = "Speak to NovaScript (transcribes and inserts)";
           _recognition = null;
         };
         try { _recognition.start(); } catch (err) {
@@ -3741,7 +3741,7 @@
         }
       }
        // Theme application (Feature): toggles a data attribute on <html> that
-      // overlay.css keys off, so the VoidScript UI (bar, chips, menu) follows the
+      // overlay.css keys off, so the NovaScript UI (bar, chips, menu) follows the
       // picked theme. "system" defers to prefers-color-scheme.
       function applyVsTheme(theme) {
         const root = document.documentElement;
@@ -4070,7 +4070,7 @@
       const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       const mergedServers = mergedMcpServers();
       // Roblox always heads the list - greyed out, no health dot (its own status
-      // is already the main VoidScript dot elsewhere) and no remove button (it's
+      // is already the main NovaScript dot elsewhere) and no remove button (it's
       // the primary server, protected bridge-side too).
       let mcpList =
         `<div class="vs-mcp-item vs-mcp-item-primary"><div class="vs-mcp-info"><span class="vs-mcp-name">Roblox Studio</span><span class="vs-mcp-url">primary - always connected</span></div></div>`;
@@ -4086,7 +4086,7 @@
       const stabilityHtml = Object.keys(stabilityEntries).length
         ? `<section class="vs-menu-sec">
             <div class="vs-sec-label"><span>Provider stability</span></div>
-            <div class="vs-menu-note">Field notes on how reliably each site works with VoidScript (they change their UI often, so treat these as "tends to").</div>
+            <div class="vs-menu-note">Field notes on how reliably each site works with NovaScript (they change their UI often, so treat these as "tends to").</div>
             ${Object.keys(stabilityEntries).map((k) => {
               const s = stabilityEntries[k];
               return `<div class="vs-prov-stab"><span class="vs-stab-lvl vs-stab-${esc(s.level)}">${esc(s.level)}</span><span class="vs-stab-name">${esc(k)}</span><span class="vs-stab-note">${esc(s.note)}</span></div>`;
@@ -4094,10 +4094,10 @@
           </section>`
         : "";
       menuEl.innerHTML =
-        `<div class="vs-menu-head"><span class="vs-menu-logo">VoidScript</span><span class="vs-menu-tag">v${EXT_VERSION}</span></div>
+        `<div class="vs-menu-head"><span class="vs-menu-logo">NovaScript</span><span class="vs-menu-tag">v${EXT_VERSION}</span></div>
          ${vsUpdateTag ? `<section class="vs-menu-sec">
            <div class="vs-sec-label"><span>Update</span></div>
-           <button class="vs-tip-opt vs-tip-update" data-u="https://github.com/cjl26rg2/Void-Script/releases"><span>Update available · v${esc(vsUpdateTag.replace(/^[vV]/, ""))}</span><span class="vs-tip-sub">get the latest build</span></button>
+           <button class="vs-tip-opt vs-tip-update" data-u="https://github.com/v4ldrix/Nova-Script/releases"><span>Update available · v${esc(vsUpdateTag.replace(/^[vV]/, ""))}</span><span class="vs-tip-sub">get the latest build</span></button>
          </section>` : ""}
          <section class="vs-menu-sec">
            <div class="vs-sec-label"><span>Create</span></div>
@@ -4215,12 +4215,12 @@
           </section>
           <section class="vs-menu-sec">
             <div class="vs-sec-label"><span>Launch at login</span></div>
-            <div class="vs-menu-note">Start the VoidScript bridge automatically when you sign in to Windows, so the extension is ready without running start.bat.</div>
+            <div class="vs-menu-note">Start the NovaScript bridge automatically when you sign in to Windows, so the extension is ready without running start.bat.</div>
             <div class="vs-set-row"><button id="vs-startup-enable">Enable</button><button id="vs-startup-disable">Disable</button><span id="vs-startup-status"></span></div>
           </section>
           <section class="vs-menu-sec">
             <div class="vs-sec-label"><span>Settings backup</span></div>
-            <div class="vs-menu-note">Export your VoidScript settings (toggles, custom prompt, project type, MCP servers, macros) to a JSON file, or import a previously exported file to restore them.</div>
+            <div class="vs-menu-note">Export your NovaScript settings (toggles, custom prompt, project type, MCP servers, macros) to a JSON file, or import a previously exported file to restore them.</div>
             <div class="vs-set-row"><button id="vs-settings-export">Export settings</button><button id="vs-settings-import">Import settings</button><input type="file" id="vs-settings-file" accept=".json,application/json" hidden /><span id="vs-settings-status"></span></div>
           </section>
           <section class="vs-menu-sec">
@@ -4258,7 +4258,7 @@
           </section>
           <section class="vs-menu-sec">
             <div class="vs-sec-label"><span>UI theme</span></div>
-            <div class="vs-menu-note">Pick the VoidScript overlay theme (does not change the AI site's own colors). System follows your OS preference.</div>
+            <div class="vs-menu-note">Pick the NovaScript overlay theme (does not change the AI site's own colors). System follows your OS preference.</div>
             <select id="vs-theme" class="vs-mcp-field">
               <option value="system">System (auto)</option>
               <option value="dark">Dark</option>
@@ -4445,7 +4445,7 @@
           }
           setWizardPrompt(
             "REVIEW MODE - code review, do NOT edit anything yet:\n" +
-            "1. Read game.ServerStorage.VoidScript.Memory (project memory).\n" +
+            "1. Read game.ServerStorage.NovaScript.Memory (project memory).\n" +
             "2. Find the project's key scripts (search_game_tree / script_read) and read them.\n" +
             "3. Review them for: (a) bugs and errors, (b) Roblox + Luau best practices and " +
             "server-authoritative correctness, (c) performance problems (WaitForChild without " +
@@ -4475,7 +4475,7 @@
           }
           setWizardPrompt(
             "EXPLAIN MY CODE - plain-English walkthrough, do NOT edit anything:\n" +
-            "1. Read game.ServerStorage.VoidScript.Memory (project memory).\n" +
+            "1. Read game.ServerStorage.NovaScript.Memory (project memory).\n" +
             "2. Find the project's key scripts (search_game_tree / script_read) and read them.\n" +
             "3. Explain what each important script/module does, the data flow between them, " +
             "and how the main systems work together - in plain, non-technical language the " +
@@ -4519,7 +4519,7 @@
         logDownBtn.addEventListener("click", async () => {
           const text = await buildLogText();
           if (!text) { logStatus.textContent = "No activity in this chat yet"; setTimeout(() => { logStatus.textContent = ""; }, 2000); return; }
-          downloadTextFile(`voidscript-session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.log`, text);
+          downloadTextFile(`novascript-session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.log`, text);
           logStatus.textContent = "Downloaded ✓";
           setTimeout(() => { logStatus.textContent = ""; }, 2000);
         });
@@ -4528,7 +4528,7 @@
       if (snapBtn) {
         snapBtn.addEventListener("click", () => {
           const snap = {
-            tool: "voidscript-export-snapshot",
+            tool: "novascript-export-snapshot",
             exportedAt: new Date().toISOString(),
             provider: P.id,
             session: { ok: A.runOk || 0, err: A.runErr || 0, startedAt: A.startedAt || 0 },
@@ -4536,7 +4536,7 @@
             macros: Object.keys(_macros || {}),
           };
           try {
-            downloadTextFile(`voidscript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, JSON.stringify(snap, null, 2));
+            downloadTextFile(`novascript-snapshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`, JSON.stringify(snap, null, 2));
             logStatus.textContent = "Snapshot exported ✓";
           } catch {
             logStatus.textContent = "Export failed";
@@ -4687,7 +4687,7 @@
         refreshStartupState();
       });
       refreshStartupState();
-      // Settings backup (Feature): export/import the user's VoidScript settings
+      // Settings backup (Feature): export/import the user's NovaScript settings
       // as JSON. Export downloads a file; import reads one back and applies it.
       const settingsExportBtn = menuEl.querySelector("#vs-settings-export");
       const settingsImportBtn = menuEl.querySelector("#vs-settings-import");
@@ -4703,8 +4703,8 @@
       if (settingsExportBtn) settingsExportBtn.addEventListener("click", () => {
         try {
           chrome.storage.local.get(SETTINGS_EXPORT_KEYS, (r) => {
-            const out = { tool: "voidscript-settings-export", exportedAt: new Date().toISOString(), settings: r || {} };
-            try { downloadTextFile(`voidscript-settings-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(out, null, 2)); settingsStatus.textContent = "Exported ✓"; }
+            const out = { tool: "novascript-settings-export", exportedAt: new Date().toISOString(), settings: r || {} };
+            try { downloadTextFile(`novascript-settings-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(out, null, 2)); settingsStatus.textContent = "Exported ✓"; }
             catch { settingsStatus.textContent = "Export failed"; }
             setTimeout(() => { settingsStatus.textContent = ""; }, 2000);
           });
@@ -4923,12 +4923,12 @@
         ? `<a id="vs-setup-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶ Watch tutorial</a>`
         : "";
       setupCard.innerHTML =
-        `<div id="vs-setup-head"><span id="vs-setup-logo">VoidScript</span><span id="vs-setup-tag">Setup</span></div>` +
+        `<div id="vs-setup-head"><span id="vs-setup-logo">NovaScript</span><span id="vs-setup-tag">Setup</span></div>` +
         `<div id="vs-setup-sub">The <b>Bridge</b> is what connects this chat to Roblox Studio. Three steps and you're running.</div>` +
         `<ol id="vs-setup-steps">` +
           `<li>Download the Bridge from GitHub</li>` +
           `<li>Run <code>start.bat</code></li>` +
-           `<li>Back here, click <b>Start VoidScript</b></li>` +
+           `<li>Back here, click <b>Start NovaScript</b></li>` +
         `</ol>` +
         `<div class="vs-setup-copy-row">` +
           `<input type="text" id="vs-setup-link" readonly value="${GITHUB_URL}">` +
@@ -4977,7 +4977,7 @@
     function refreshSetup(bridgeConnected) {
       if (setupSeen || bridgeConnected) { hideSetup(); return; }
       // Bridge is down, but if the user is just READING an existing
-      // conversation with no VoidScript session (the "No agent here" state),
+      // conversation with no NovaScript session (the "No agent here" state),
       // a "bridge down" onboarding popup is pure noise - they may not want an
       // agent here at all (user request). Keep it for the states where the
       // bridge actually matters: a fresh/empty chat (the Start affordance is
@@ -5175,7 +5175,7 @@
       }
       if (!dot) return;
       const servers = s.servers || [];
-      // VoidScript status tracks ONLY the primary Roblox MCP server. Every other
+      // NovaScript status tracks ONLY the primary Roblox MCP server. Every other
       // server is an addon and must NEVER make the dot/gate look connected while
       // Roblox itself is down. Old bridges don't send per-server health, so fall
       // back to the aggregate signals they do send (mcpAlive / total tools).
@@ -5261,8 +5261,8 @@
       const videoLink = VIDEO_URL
         ? `<a class="vs-banner-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶ Watch setup tutorial</a>`
         : "";
-      b.innerHTML = `<div class="vs-banner-t">⚠ Lost connection to VoidScript</div>
-        <div class="vs-banner-m">The VoidScript bridge stopped on your PC. Restart it (run start.bat and keep Roblox Studio open): the agent will reconnect automatically as soon as it is detected again.</div>
+      b.innerHTML = `<div class="vs-banner-t">⚠ Lost connection to NovaScript</div>
+        <div class="vs-banner-m">The NovaScript bridge stopped on your PC. Restart it (run start.bat and keep Roblox Studio open): the agent will reconnect automatically as soon as it is detected again.</div>
         <div class="vs-banner-acts">${videoLink}<button class="vs-banner-x">Close</button></div>`;
       b.querySelector(".vs-banner-x").addEventListener("click", () => { b.remove(); if (bridgeBannerEl === b) bridgeBannerEl = null; });
       root.appendChild(b);
@@ -5377,7 +5377,7 @@
       if (A.started || !P.isFreshChat()) return;
       if (!nudged) {
         nudged = true;
-        toast("Tip: click “▶ Start VoidScript” to let the AI control Roblox Studio.");
+        toast("Tip: click “▶ Start NovaScript” to let the AI control Roblox Studio.");
       }
       if (!actionBtn) return;
       actionBtn.classList.add("vs-flash");
@@ -5955,7 +5955,7 @@
     }
     // Templates and tools are build briefs for the running agent.
     async function runBrief(item) {
-      if (!A.started) { toast("Press Start VoidScript first, then pick it again."); return; }
+      if (!A.started) { toast("Press Start NovaScript first, then pick it again."); return; }
       if (A.running || A.starting || A.injecting) { toast("The agent is busy - wait for it or press Stop."); return; }
       kitPanel.hidden = true;
       try { const base = await submitAndGetBase(`${item.name}: ${item.brief}`); await agentLoop(base); }
@@ -6170,7 +6170,7 @@
       root.appendChild(b);
     }
 
-    // Left-hand VoidScript popup showing the latest screen_capture. Fed from the
+    // Left-hand NovaScript popup showing the latest screen_capture. Fed from the
     // in-memory base64 (a data: URL always renders), so it works identically on
     // every provider and never touches the site's DOM. Only the most recent
     // capture is kept - a new one replaces the old.
@@ -6281,7 +6281,7 @@
   }
 
   // Timestamp of the user's last REAL click on the site (trusted event, outside
-  // VoidScript's own UI). A genuine "regenerate ↻" is always such a click;
+  // NovaScript's own UI). A genuine "regenerate ↻" is always such a click;
   // DeepSeek's post-stop phantom generations and stop-button re-mount flickers
   // never are - this is what tells them apart (seen live: two false regenResume
   // fired 8s/2s after a Stop with no user action, un-stopping the halted turn).
@@ -6412,7 +6412,7 @@
     // - stopLoop both halts our loop AND clicks the site's native stop - and the
     // site's native stop likewise halts our loop via onNativeStop, so either one
     // fully stops everything. Two stop buttons at once is fine.
-    // The bare isHardGenerating() term is gated on a live VoidScript session: on
+    // The bare isHardGenerating() term is gated on a live NovaScript session: on
     // a plain chat with no session, a user's own message makes the site generate,
     // and we must NOT briefly flash our Stop button over that.
     // Self-heal a stuck "Stopping…": if we flagged stopping but nothing is
@@ -6570,9 +6570,9 @@
       }
     });
   } catch {}
-  // A conversation IS a VoidScript session if any rendered turn carries a
+  // A conversation IS a NovaScript session if any rendered turn carries a
   // telltale artefact: the system-prompt marker, an injected tool-result /
-  // system-note turn, or a VoidScript command an assistant wrote. Works even
+  // system-note turn, or a NovaScript command an assistant wrote. Works even
   // after a full cold start and regardless of scroll position.
   function domHasVsSignal() {
     for (const it of P.allItems()) {
@@ -6622,10 +6622,10 @@
       }
     }
     // Same idea for a RUNNING loop: if the user opens a NEW, empty conversation
-    // via the SITE's own new-chat (not VoidScript's button), the loop is bound to
+    // via the SITE's own new-chat (not NovaScript's button), the loop is bound to
     // a chat the user left, so abandon it. Otherwise A.running keeps this function
     // early-returning below and the stale "Agent active" / Stop button lingers on
-    // the fresh chat instead of "Start VoidScript". The "/app" → "/app/<id>" id
+    // the fresh chat instead of "Start NovaScript". The "/app" → "/app/<id>" id
     // assignment of the SAME chat is not a move (loopKey is pinned only once the
     // chat has both an id and content), so a normal session is never disturbed.
     if (A.running) {
@@ -6787,7 +6787,7 @@
 
   syncSessionState();
 
-  // Live settings sync: when the popup (or another tab) changes a VoidScript setting
+  // Live settings sync: when the popup (or another tab) changes a NovaScript setting
   // in chrome.storage, apply it to THIS running page immediately - no reload needed.
   // Covers the popup's quick toggles (Co-work, auto-verify, guard, background…) and
   // the theme picker.
@@ -6945,5 +6945,5 @@
     agentLoop(P.assistantCount() - 1);
   }, 1000);
 
-  log(`VoidScript content script ready (provider: ${P.id})`);
+  log(`NovaScript content script ready (provider: ${P.id})`);
 })();

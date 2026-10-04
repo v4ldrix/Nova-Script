@@ -3,7 +3,7 @@
 // generation chat. Built on the generic factory (providers/_generic.js).
 // Best-guess selectors; re-verify live if turns are not read or send fails.
 // v0 is code-generation-oriented; its replies are heavy on code blocks, which
-// suits VoidScript's fenced-command extraction.
+// suits NovaScript's fenced-command extraction.
 // eslint-disable-next-line no-unused-vars
 const VSProvider = VSGeneric({
   id: "v0",

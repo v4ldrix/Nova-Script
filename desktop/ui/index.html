@@ -4,7 +4,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>VoidScript</title>
+<title>NovaScript</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -67,12 +67,12 @@
     <!-- ── HOME ──────────────────────────────────────────────────────────── -->
     <section class="view active" id="view-home">
       <div id="update-banner" class="banner acc" hidden>
-        <strong>VoidScript updated.</strong> The bridge is already on the new version — quit and reopen the app to load the new app too.
+        <strong>NovaScript updated.</strong> The bridge is already on the new version — quit and reopen the app to load the new app too.
       </div>
       <div class="hero">
         <div>
           <h1>Build Roblox games with AI.</h1>
-          <p class="sub">VoidScript connects AI to your open Roblox Studio. Keep this app running while you build.</p>
+          <p class="sub">NovaScript connects AI to your open Roblox Studio. Keep this app running while you build.</p>
           <p class="how-note"><b>Two ways to build:</b> use ChatGPT, DeepSeek, Gemini and the rest through the <b>browser extension</b>, or chat here with <b>your own NVIDIA / OpenRouter API key</b>. The in-app chat only has the models your key gives you, not every AI.</p>
         </div>
         <div class="hero-actions">
@@ -110,7 +110,7 @@
           <ol class="steps">
             <li>Open <b>Roblox Studio</b> and enable <i>Studio as MCP server</i> (Assistant settings).</li>
             <li>Keep the <b>bridge</b> running (this app).</li>
-            <li>Open an AI site with the VoidScript extension and press <b>Start VoidScript</b>.</li>
+            <li>Open an AI site with the NovaScript extension and press <b>Start NovaScript</b>.</li>
           </ol>
           <div class="row">
             <button class="btn sm" data-url="https://chat.deepseek.com/">DeepSeek</button>
@@ -161,7 +161,7 @@
         <div class="empty" id="chat-empty">
           <img src="assets/logo.png" alt="" class="empty-logo" />
           <h2>What are we building?</h2>
-          <p class="muted" id="chat-empty-sub">Describe a feature and VoidScript builds it in your open Studio place.</p>
+          <p class="muted" id="chat-empty-sub">Describe a feature and NovaScript builds it in your open Studio place.</p>
           <div class="suggest">
             <button class="sugg">Make a spinning coin that gives +1 cash when touched</button>
             <button class="sugg">Build a 5-stage obby with checkpoints</button>
@@ -190,7 +190,7 @@
             <svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/></svg>Self-check<i></i></button>
           <button class="mtog" id="btn-plan" title="The AI looks around and writes a plan first. Nothing changes until you press Build it.">
             <svg viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6h.01M4 12h.01M4 18h.01"/></svg>Plan first<i></i></button>
-          <button class="mtog" id="btn-memory" title="Project memory: the AI keeps notes about this game in ServerStorage.VoidScript.Memory, shared with the browser extension, so it remembers what was done last time">
+          <button class="mtog" id="btn-memory" title="Project memory: the AI keeps notes about this game in ServerStorage.NovaScript.Memory, shared with the browser extension, so it remembers what was done last time">
             <svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>Memory<i></i></button>
         </div>
       </div>
@@ -199,7 +199,7 @@
         <button class="btn icon" id="btn-attach" title="Attach reference files (or drop them on the window)" aria-label="Attach reference files">
           <svg viewBox="0 0 24 24"><path d="M21 11.5 12.3 20.2a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5"/></svg>
         </button>
-        <textarea id="chat-input" rows="1" placeholder="Ask VoidScript to build something…"></textarea>
+        <textarea id="chat-input" rows="1" placeholder="Ask NovaScript to build something…"></textarea>
         <button class="btn primary" id="btn-send">Send</button>
         <button class="btn danger" id="btn-stop-chat" hidden>Stop</button>
       </div>
@@ -400,7 +400,7 @@
     <!-- ── MCP SERVERS ───────────────────────────────────────────────────── -->
     <section class="view" id="view-mcp">
       <div class="view-h">
-        <div><h2>MCP servers</h2><p class="muted">Plug extra apps into VoidScript, like Blender. Their tools work in the in-app chat and through the extension. Adding or removing one restarts the bridge.</p></div>
+        <div><h2>MCP servers</h2><p class="muted">Plug extra apps into NovaScript, like Blender. Their tools work in the in-app chat and through the extension. Adding or removing one restarts the bridge.</p></div>
       </div>
       <div class="card mcp-card">
         <div class="card-t">Catalog <span class="tag">one click</span></div>
@@ -440,7 +440,7 @@
     <!-- ── UPDATES ───────────────────────────────────────────────────────── -->
     <section class="view" id="view-updates">
       <div class="view-h">
-        <div><h2>Updates</h2><p class="muted">VoidScript updates itself here: the app, the bridge and the extension files, all in one go.</p></div>
+        <div><h2>Updates</h2><p class="muted">NovaScript updates itself here: the app, the bridge and the extension files, all in one go.</p></div>
         <button class="btn sm" id="btn-upd-check">Check now</button>
       </div>
       <div class="card upd-card">
@@ -467,7 +467,7 @@
 
       <div class="card">
         <div class="card-t">AI provider</div>
-        <p class="muted">Powers the built-in Chat. Keys are stored in VoidScript's settings on this PC and are only ever sent to the provider they belong to.</p>
+        <p class="muted">Powers the built-in Chat. Keys are stored in NovaScript's settings on this PC and are only ever sent to the provider they belong to.</p>
         <div class="seg" id="prov-seg">
           <button data-prov="nvidia">NVIDIA</button>
           <button data-prov="openrouter">OpenRouter</button>
@@ -514,7 +514,7 @@
         <div class="field">
           <label>Theme</label>
           <div class="seg" id="theme-seg">
-            <button data-theme="void">VoidScript</button>
+            <button data-theme="void">NovaScript</button>
             <button data-theme="or">OR</button>
           </div>
         </div>
@@ -527,19 +527,19 @@
           <label>AI reply language</label>
           <select class="input" id="set-lang"></select>
         </div>
-        <label class="switch-row"><span>Start the bridge when VoidScript opens</span><span class="switch"><input type="checkbox" id="set-autostart" /><span class="track"></span></span></label>
-        <label class="switch-row"><span>Closing the window keeps VoidScript running in the tray</span><span class="switch"><input type="checkbox" id="set-tray" /><span class="track"></span></span></label>
+        <label class="switch-row"><span>Start the bridge when NovaScript opens</span><span class="switch"><input type="checkbox" id="set-autostart" /><span class="track"></span></span></label>
+        <label class="switch-row"><span>Closing the window keeps NovaScript running in the tray</span><span class="switch"><input type="checkbox" id="set-tray" /><span class="track"></span></span></label>
       </div>
 
       <div class="card">
         <div class="card-t">About</div>
-        <p class="muted">VoidScript <span id="about-ver"></span> · free &amp; open-source (GPL-3.0) · not affiliated with Roblox Corporation.</p>
+        <p class="muted">NovaScript <span id="about-ver"></span> · free &amp; open-source (GPL-3.0) · not affiliated with Roblox Corporation.</p>
         <div class="row">
           <button class="btn sm" id="btn-show-disclaimer">Disclaimer</button>
           <button class="btn sm ghost" data-url="https://voidstudioai.netlify.app/">Website</button>
-          <button class="btn sm ghost" data-url="https://github.com/cjl26rg2/Void-Script">GitHub</button>
+          <button class="btn sm ghost" data-url="https://github.com/v4ldrix/Nova-Script">GitHub</button>
           <button class="btn sm ghost" data-url="https://discord.gg/EyGxnp2jaw">Discord</button>
-          <button class="btn sm ghost" id="btn-quit">Quit VoidScript</button>
+          <button class="btn sm ghost" id="btn-quit">Quit NovaScript</button>
         </div>
       </div>
     </section>
@@ -552,11 +552,11 @@
     <img src="assets/logo.png" alt="" class="modal-logo" />
     <h2>Before you start</h2>
     <ul class="disc">
-      <li><b>AI makes mistakes.</b> It can break scripts or delete things in your place. Save and back up your work — VoidScript has Undo and place backups, but they are not a guarantee.</li>
+      <li><b>AI makes mistakes.</b> It can break scripts or delete things in your place. Save and back up your work — NovaScript has Undo and place backups, but they are not a guarantee.</li>
       <li><b>You are in control.</b> The AI acts in your open Roblox Studio through the tools listed in this app. Stop it any time.</li>
       <li><b>Workspace access is off by default.</b> If you turn it on, the AI can read and change files and run commands inside the one folder you choose. <b>Full PC</b> access lifts that limit. Only use it with a model you trust, and read each approval before you allow it.</li>
       <li><b>Chat sites and API providers</b> see what you send them. Don't share secrets, passwords or personal data with the AI.</li>
-      <li>VoidScript is free, open-source software provided <b>as is, without warranty</b>, and is <b>not affiliated with Roblox Corporation</b>, NVIDIA or any AI provider.</li>
+      <li>NovaScript is free, open-source software provided <b>as is, without warranty</b>, and is <b>not affiliated with Roblox Corporation</b>, NVIDIA or any AI provider.</li>
     </ul>
     <label class="check big"><input type="checkbox" id="disc-ok" /> I understand and want to continue</label>
     <div class="row end"><button class="btn primary" id="btn-disc-accept" disabled>Continue</button></div>
@@ -584,9 +584,9 @@
 <div id="updating" hidden>
   <div class="upd-box">
     <div class="upd-ring"><img src="assets/logo.png" alt="" /></div>
-    <h2 id="updating-title">VoidScript is currently updating</h2>
+    <h2 id="updating-title">NovaScript is currently updating</h2>
     <p class="muted" id="updating-line">Getting the new version…</p>
-    <p class="upd-hint">Keep this window open. VoidScript reopens by itself when it's done.</p>
+    <p class="upd-hint">Keep this window open. NovaScript reopens by itself when it's done.</p>
     <div class="upd-fail" id="updating-fail" hidden>
       <pre id="updating-err"></pre>
       <button class="btn" id="btn-updating-close">Close</button>

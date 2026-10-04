@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Inside model.html: draws whatever model the VoidScript panel posts to it.
+// Inside model.html: draws whatever model the NovaScript panel posts to it.
 "use strict";
 const view = VSModelView.create(document.getElementById("v"));
 window.addEventListener("message", (e) => {

@@ -1,7 +1,7 @@
 [package]
-name = "voidscript"
+name = "novascript"
 version = "6.1.0"
-description = "VoidScript - AI agent for Roblox Studio"
+description = "NovaScript - AI agent for Roblox Studio"
 edition = "2021"
 license = "GPL-3.0-or-later"
 

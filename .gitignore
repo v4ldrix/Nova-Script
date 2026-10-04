@@ -22,5 +22,6 @@ __pycache__/
 .kilo/
 
 # Built app and release leftovers (the exe ships in the release zip, see make-release.bat)
-VoidScript.exe
+NovaScript.exe
 *.old
+check_update.json

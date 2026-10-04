@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* overlay.css - VoidScript Free in-page UI. Scoped under #vs-root / .vs-* */
+/* overlay.css - NovaScript Free in-page UI. Scoped under #vs-root / .vs-* */
 
 #vs-root {
   position: fixed;
@@ -10,7 +10,7 @@
 /* CRITICAL: our bar elements set an explicit display (flex/inline-flex), whose ID
    specificity beats the UA `[hidden]{display:none}` rule — so `el.hidden = true`
    from JS would NOT actually hide them. This makes the `hidden` attribute win again
-   for every VoidScript control, so Co-work/steer, Undo, the quick buttons, voice,
+   for every NovaScript control, so Co-work/steer, Undo, the quick buttons, voice,
    pause, etc. stay hidden until the code shows them. */
 #vs-bar [hidden], #vs-bar[hidden], #vs-root [hidden], #vs-root[hidden] { display: none !important; }
 
@@ -232,7 +232,7 @@ html.vs-light #vs-pause:hover { background: rgba(0, 0, 0, 0.10); color: #111827;
    on its own full-width line just under the controls. */
 #vs-bar.vs-bar-cowork { flex-wrap: wrap; row-gap: 8px; }
 
-/* Co-work toggle: neutral when off, warm VoidScript gradient when armed. */
+/* Co-work toggle: neutral when off, warm NovaScript gradient when armed. */
 #vs-cowork {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   height: 28px; padding: 0 10px;
@@ -1009,7 +1009,7 @@ ol.flex-col-reverse > div.w-full:not(.mx-auto) > .vs-chip {
 }
 #vs-setup-dismiss:hover { background: rgba(255, 255, 255, 0.07); }
 
-/* ── capture preview popup (left-hand, VoidScript style) ─────── */
+/* ── capture preview popup (left-hand, NovaScript style) ─────── */
 .vs-shot {
   position: fixed; left: 18px; top: 72px; width: 300px; max-width: 32vw;
   background: rgba(16, 18, 26, 0.94); color: #f1f2f8;
@@ -1241,7 +1241,7 @@ html[data-vs-theme="or"] #vs-brand {
   text-transform: uppercase; letter-spacing: 2.4px; font-weight: 800; font-size: 12px;
 }
 html[data-vs-theme="or"] .vs-free { color: #8f8a80; letter-spacing: .3px; text-transform: none; }
-/* Co-branding: the OR theme reads "OR × VOIDSCRIPT". */
+/* Co-branding: the OR theme reads "OR × NOVASCRIPT". */
 html[data-vs-theme="or"] #vs-brand::before { content: "OR \00d7  "; white-space: pre; }
 html[data-vs-theme="or"] #vs-mark { filter: grayscale(1) brightness(1.6) !important; }
 html[data-vs-theme="or"] #vs-state { color: #b8b2a7; }

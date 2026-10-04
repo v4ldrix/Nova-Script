@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// VoidScript popup: shows bridge/Studio status and exposes reconnect, restart,
+// NovaScript popup: shows bridge/Studio status and exposes reconnect, restart,
 // settings, website and tip actions. Talks to background.js over the same
 // message protocol the rest of the extension uses ("status" / "reconnect" /
 // "restart_mcp" requests, "vs-status" broadcasts, "vs-open-menu" to a tab).
@@ -7,7 +7,7 @@
 const LINKS = {
   site: "https://voidstudioai.netlify.app/",
   fallbackAI: "https://chat.deepseek.com/",
-  releases: "https://github.com/cjl26rg2/Void-Script/releases",
+  releases: "https://github.com/v4ldrix/Nova-Script/releases",
 };
 
 // One source of truth for every supported site: its display name and a matcher.
@@ -288,7 +288,7 @@ $("btn-diag").onclick = async () => {
   }
   const d = r.diagnostics;
   const summary = [
-    `VoidScript bridge v${d.bridge_version} (pid ${d.pid}, up ${Math.round((d.uptime_s || 0) / 60)}m)`,
+    `NovaScript bridge v${d.bridge_version} (pid ${d.pid}, up ${Math.round((d.uptime_s || 0) / 60)}m)`,
     `Platform: ${d.platform} · Python ${d.python} · ws://${d.host}:${d.port}`,
     `Origin auth: ${d.origin_auth ? "on" : "OFF"} · Token auth: ${d.token_auth ? "on" : "off"}`,
     `Studio: app=${d.studio && d.studio.app} place=${d.studio && d.studio.place} proc=${d.studio_proc}`,

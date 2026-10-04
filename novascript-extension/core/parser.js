@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// core/parser.js - VoidScript command parsing. PURE string logic, zero DOM:
+// core/parser.js - NovaScript command parsing. PURE string logic, zero DOM:
 // the provider extracts a turn's text from the site's DOM; everything here
 // operates on that text. The command formats (###LUA### blocks, {"command":…}
 // JSON) are defined by OUR system prompt, so they are the same on every AI site
@@ -88,7 +88,7 @@ const VSParse = (() => {
   }
 
   // Normalise a parsed JSON object into { tool, arguments }, accepting both the
-  // new VoidScript schema ("command"/"params") and the legacy/function-calling
+  // new NovaScript schema ("command"/"params") and the legacy/function-calling
   // schema ("tool"/"arguments"/"name"/"args"). Returns null if not a valid call.
   function normalizeCall(o) {
     if (!o || typeof o !== "object") return null;
@@ -366,7 +366,7 @@ const VSParse = (() => {
     return stripCodeChrome(text.slice(ls + len, le).trim());
   }
 
-  // The assistant emitted a VoidScript command (JSON or a ###LUA### block).
+  // The assistant emitted a NovaScript command (JSON or a ###LUA### block).
   function hasCommandShape(txt) {
     return txt.includes(START_M) ||
            LUA_START_RE.test(txt) ||

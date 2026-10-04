@@ -116,7 +116,7 @@ const VSProvider = (() => {
   const assistantItems = () => [...document.querySelectorAll(S.assistantItem)];
   const assistantCount = () => assistantItems().length;
   const userCount = () => document.querySelectorAll(S.userItem).length;
-  // Scope to the SITE's composer only: skip VoidScript's own injected UI (the
+  // Scope to the SITE's composer only: skip NovaScript's own injected UI (the
   // settings textarea #vs-set-text in #vs-root). On login/OAuth pages with no
   // site editor this returns null, keeping the "not on a chat page" guard in
   // the send hooks intact (otherwise our own textarea would defeat it and the
@@ -147,7 +147,7 @@ const VSProvider = (() => {
   // message is actually sent, validated live 2026-07). Gating on the URL left
   // isFreshChat() - and, transitively, conversationKey() below - still seeing
   // the OLD conversation id on a chat that was visually empty, so the
-  // VoidScript bar stuck on "Agent active" with no way to start a new session.
+  // NovaScript bar stuck on "Agent active" with no way to start a new session.
   const isFreshChat = () => chatIsEmpty() && !!getEditor();
 
   // The composer box the Start gate hides as one unit.
@@ -361,7 +361,7 @@ const VSProvider = (() => {
     const lines = String(text).split("\n");
     if (text.length <= SEND_MAX_CHARS && lines.length <= SEND_MAX_LINES) return text;
     const marker = (what) =>
-      `\n\n[…VoidScript: result truncated (${what}) so it can be pasted into ` +
+      `\n\n[…NovaScript: result truncated (${what}) so it can be pasted into ` +
       `Gemini's composer without freezing the page. Do NOT re-run the command; ` +
       `work with the head and tail shown here…]\n\n`;
     let out, note;
@@ -504,7 +504,7 @@ const VSProvider = (() => {
     const arr = new Uint8Array(bin.length);
     for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
     const ext = mime.includes("png") ? "png" : "jpg";
-    return new File([arr], `voidscript_${Date.now()}_${i}.${ext}`, { type: mime });
+    return new File([arr], `novascript_${Date.now()}_${i}.${ext}`, { type: mime });
   }
   async function attachImages(images) {
     const ed = getEditor();
@@ -694,7 +694,7 @@ const VSProvider = (() => {
     // watcher uses this to refuse finalizing before this send's reply turn
     // exists (fixes premature loop.end on the previous turn's stable text).
     reliableCounts: true,
-    // Shown as a permanent, non-intrusive notice in the VoidScript panel.
+    // Shown as a permanent, non-intrusive notice in the NovaScript panel.
     // Gemini drifts away from emitting tool blocks after a while in long
     // sessions - observed live, model behavior, not something the prompt fixes.
     unstableWarning:

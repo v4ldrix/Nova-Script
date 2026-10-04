@@ -130,7 +130,7 @@ function VSGeneric(cfg) {
   const assistantCount = () => assistantItems().length;
   const userCount = () => document.querySelectorAll(S.userItem).length;
 
-  // Scope to the SITE's composer only: skip VoidScript's own injected UI so our
+  // Scope to the SITE's composer only: skip NovaScript's own injected UI so our
   // settings textarea never defeats the "not on a chat page" guard.
   const getEditor = () => {
     for (const e of document.querySelectorAll(S.editor)) {
@@ -466,7 +466,7 @@ function VSGeneric(cfg) {
     const arr = new Uint8Array(bin.length);
     for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
     const ext = mime.includes("png") ? "png" : "jpg";
-    return new File([arr], `voidscript_${Date.now()}_${i}.${ext}`, { type: mime });
+    return new File([arr], `novascript_${Date.now()}_${i}.${ext}`, { type: mime });
   }
   const fileInputEl = () => {
     const c = composerFrame();
@@ -585,7 +585,7 @@ function VSGeneric(cfg) {
     timings,
     thinkingSel: S.thinking,
     chipAtItemLevel: cfg.chipAtItemLevel !== false,
-    // A permanent, non-intrusive notice shown in the VoidScript panel so users
+    // A permanent, non-intrusive notice shown in the NovaScript panel so users
     // know a factory-built provider may need live tuning.
     unstableWarning:
       cfg.unstableWarning ||

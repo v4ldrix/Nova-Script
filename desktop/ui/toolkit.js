@@ -123,7 +123,7 @@ return HttpService:JSONEncode(R)`;
     return { raw: r, issues, score, grade: score >= 90 ? "A" : score >= 75 ? "B" : score >= 55 ? "C" : score >= 35 ? "D" : "F" };
   }
   function fixPrompt(rep) {
-    return "VoidScript's health check found these issues in this place:\n" +
+    return "NovaScript's health check found these issues in this place:\n" +
       rep.issues.map((i) => `- [${i.sev}] ${i.title}: ${i.text}`).join("\n") +
       "\n\nFix what's safe to fix with surgical edits (remove backdoor code only after checking it really is malicious, anchor loose parts that should be static, replace outdated calls). Ask me before deleting anything bigger than a few lines. Then summarise what you changed.";
   }
@@ -147,14 +147,14 @@ return HttpService:JSONEncode(R)`;
   function lightingLuau(id) {
     const p = LIGHTING.find((x) => x.id === id) || LIGHTING[0];
     const L = [`local Lighting = game:GetService("Lighting")`, `local CH = game:GetService("ChangeHistoryService")`, `CH:SetWaypoint("Before lighting")`,
-      `for _, o in Lighting:GetChildren() do if o.Name:sub(1, 10) == "VoidScript" then o:Destroy() end end`];
+      `for _, o in Lighting:GetChildren() do if o.Name:sub(1, 10) == "NovaScript" then o:Destroy() end end`];
     for (const [k, v] of Object.entries(p.L)) L.push(`Lighting.${k} = ${typeof v === "string" ? c3(v) : v}`);
     L.push(`Lighting.GlobalShadows = true`, `pcall(function() Lighting.Technology = Enum.Technology.Future end)`);
-    L.push(`local a = Lighting:FindFirstChildOfClass("Atmosphere") or Instance.new("Atmosphere") a.Name = "VoidScriptAtmosphere"`,
+    L.push(`local a = Lighting:FindFirstChildOfClass("Atmosphere") or Instance.new("Atmosphere") a.Name = "NovaScriptAtmosphere"`,
       `a.Density = ${p.atm.Density} a.Haze = ${p.atm.Haze} a.Color = ${c3(p.atm.Color)} a.Decay = ${c3(p.atm.Decay)} a.Glare = ${p.atm.Glare} a.Parent = Lighting`,
-      `local cc = Instance.new("ColorCorrectionEffect") cc.Name = "VoidScriptColor" cc.Brightness = ${p.cc.Brightness} cc.Contrast = ${p.cc.Contrast} cc.Saturation = ${p.cc.Saturation} cc.TintColor = ${c3(p.cc.TintColor)} cc.Parent = Lighting`,
-      `local b = Instance.new("BloomEffect") b.Name = "VoidScriptBloom" b.Intensity = ${p.bloom[0]} b.Size = ${p.bloom[1]} b.Threshold = ${p.bloom[2]} b.Parent = Lighting`,
-      `local r = Instance.new("SunRaysEffect") r.Name = "VoidScriptSunRays" r.Intensity = ${p.rays[0]} r.Spread = ${p.rays[1]} r.Parent = Lighting`,
+      `local cc = Instance.new("ColorCorrectionEffect") cc.Name = "NovaScriptColor" cc.Brightness = ${p.cc.Brightness} cc.Contrast = ${p.cc.Contrast} cc.Saturation = ${p.cc.Saturation} cc.TintColor = ${c3(p.cc.TintColor)} cc.Parent = Lighting`,
+      `local b = Instance.new("BloomEffect") b.Name = "NovaScriptBloom" b.Intensity = ${p.bloom[0]} b.Size = ${p.bloom[1]} b.Threshold = ${p.bloom[2]} b.Parent = Lighting`,
+      `local r = Instance.new("SunRaysEffect") r.Name = "NovaScriptSunRays" r.Intensity = ${p.rays[0]} r.Spread = ${p.rays[1]} r.Parent = Lighting`,
       `CH:SetWaypoint("Lighting: ${p.name}")`, `return "Lighting set to ${p.name}"`);
     return L.join("\n");
   }

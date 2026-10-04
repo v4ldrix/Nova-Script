@@ -127,7 +127,7 @@ const VSUI = (() => {
     // Parents before children (stable), so every element's parent exists when it's built.
     const depth = (e) => { let d = 0, p = e.p; while (p && d < 40) { d++; p = byName.get(p).p; } return d; };
     els.sort((x, y) => depth(x) - depth(y));
-    return { name: String((raw && raw.name) || "VoidScriptGui").replace(/[^\w]/g, "").slice(0, 40) || "VoidScriptGui", elements: els, script: String((raw && raw.script) || "") };
+    return { name: String((raw && raw.name) || "NovaScriptGui").replace(/[^\w]/g, "").slice(0, 40) || "NovaScriptGui", elements: els, script: String((raw && raw.script) || "") };
   }
 
   // ── preview: HTML at a 16:9 "screen" that scales with its container ─────────
@@ -200,7 +200,7 @@ const VSUI = (() => {
   }
   function toLuau(spec) {
     const L = [
-      `-- ${spec.name} · ${spec.elements.length} elements · made with VoidScript`,
+      `-- ${spec.name} · ${spec.elements.length} elements · made with NovaScript`,
       `local CH = game:GetService("ChangeHistoryService")`,
       `CH:SetWaypoint("Before ${spec.name}")`,
       `local gui = Instance.new("ScreenGui")`,

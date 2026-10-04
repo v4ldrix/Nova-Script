@@ -1,7 +1,7 @@
-# VoidScript — Independent Rebuild Plan
+# NovaScript — Independent Rebuild Plan
 
 Goal: replace the GPL-derived ZeroScript core with a **clean-room, self-made**
-implementation, one component at a time, until nothing in VoidScript is a
+implementation, one component at a time, until nothing in NovaScript is a
 derivative work and we can relicense freely.
 
 ## Ground rules (so the result is genuinely independent)
@@ -134,7 +134,7 @@ each validated live. Beta providers already ride the factory.
 ### Phase 8 — Cutover & relicense — `final`
 When Phases 1–7 pass with no original files remaining: remove the GPL-derived
 files, drop the ZeroScript-required notices we no longer need, and set the
-license VoidScript will ship under. Keep a courteous "inspired by ZeroScript"
+license NovaScript will ship under. Keep a courteous "inspired by ZeroScript"
 note if desired (optional once nothing is derivative).
 
 ---
@@ -158,7 +158,7 @@ note if desired (optional once nothing is derivative).
 - [x] Phase 6 — Agent core — **built & mock-tested** (`rebuild/core.js`, 18/18).
 - [x] Phase 7 — Entry / providers — **entry built & wiring-tested** (`rebuild/entry.js`,
   8/8); provider interface already ours.
-- [~] Phase 8 — Cutover & relicense — **testable build ready** (`voidscript-rebuild/`,
+- [~] Phase 8 — Cutover & relicense — **testable build ready** (`novascript-rebuild/`,
   a loadable extension running only the self-made engine; 40 JS files valid).
   Awaiting a **live browser run** on a real AI + Studio. The irreversible steps
   (delete GPL core, relicense, swap shipping files) come only after that passes.
