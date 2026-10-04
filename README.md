@@ -1,6 +1,6 @@
 # NovaScript - Free AI Agent for Roblox Studio
 
-CREDITS TO ZEROSCRIPT, THIS IS JUST A BETTER VERSION.
+CREDITS TO ZEROSCRIPT AND VOIDSCRIPT, THIS IS JUST A BETTER VERSION.
 
 ![GitHub stars](https://img.shields.io/github/stars/cjl26rg2/Void-Script?style=social)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)
