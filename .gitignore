@@ -25,3 +25,5 @@ __pycache__/
 NovaScript.exe
 *.old
 check_update.json
+
+public/
