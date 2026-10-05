@@ -1156,6 +1156,159 @@
 
     footer a { color: var(--fg-muted); }
     footer a:hover { color: var(--accent-gold); }
+    /* ===== Vibey download hero ===== */
+    .vibe-hero {
+      min-height: calc(100vh - 116px);
+      min-height: calc(100svh - 116px);
+      padding: 40px 0 72px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      overflow: hidden;
+      isolation: isolate;
+    }
+
+    .vibe-bg { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
+
+    .vibe-bg .blob {
+      position: absolute;
+      width: 46vmax;
+      height: 46vmax;
+      border-radius: 50%;
+      filter: blur(90px);
+      opacity: 0.45;
+      animation: vibe-float 18s ease-in-out infinite alternate;
+    }
+    .vibe-bg .b1 { background: #6350f2; top: -18vmax; left: -12vmax; }
+    .vibe-bg .b2 { background: #e5c483; bottom: -24vmax; right: -14vmax; opacity: 0.28; animation-delay: -6s; }
+    .vibe-bg .b3 { background: #f43f5e; top: 30%; left: 45%; width: 28vmax; height: 28vmax; opacity: 0.22; animation-delay: -12s; }
+
+    .vibe-grid {
+      position: absolute; inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
+      background-size: 56px 56px;
+      mask-image: radial-gradient(ellipse at center, #000 20%, transparent 70%);
+      -webkit-mask-image: radial-gradient(ellipse at center, #000 20%, transparent 70%);
+    }
+
+    @keyframes vibe-float {
+      0%   { transform: translate(0, 0) scale(1); }
+      50%  { transform: translate(6vmax, 4vmax) scale(1.12); }
+      100% { transform: translate(-4vmax, 7vmax) scale(0.95); }
+    }
+
+    .vibe-inner { display: flex; flex-direction: column; align-items: center; }
+
+    .vibe-pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 7px 16px;
+      border-radius: 999px;
+      border: 1px solid var(--border-bright);
+      background: rgba(255,255,255,0.05);
+      backdrop-filter: blur(8px);
+      font-size: 13px; font-weight: 600; color: var(--fg);
+      margin-bottom: 26px;
+    }
+    .vibe-pill .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 10px var(--accent-emerald);
+      animation: vibe-pulse 1.8s ease-in-out infinite;
+    }
+    @keyframes vibe-pulse { 50% { opacity: 0.35; transform: scale(0.8); } }
+
+    .vibe-title {
+      font-family: var(--sans);
+      font-size: clamp(38px, 6.4vw, 84px);
+      font-weight: 800;
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      margin-bottom: 22px;
+    }
+    .vibe-grad {
+      background: linear-gradient(90deg, #8996ff, #f0a8ff, #e5c483, #8996ff);
+      background-size: 300% 100%;
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+      animation: vibe-shift 8s linear infinite;
+    }
+    @keyframes vibe-shift { to { background-position: 300% 0; } }
+
+    .vibe-lead {
+      max-width: 640px;
+      font-size: clamp(16px, 1.6vw, 19px);
+      color: var(--fg-muted);
+      margin-bottom: 36px;
+    }
+
+    .vibe-cta { display: flex; flex-direction: column; align-items: center; gap: 16px; margin-bottom: 34px; }
+
+    .dl-btn {
+      position: relative;
+      display: inline-flex; align-items: center; gap: 16px;
+      padding: 16px 30px 16px 22px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #f3d9a2, #e5c483 45%, #c9a4ff);
+      color: #0d0c10;
+      text-align: left;
+      box-shadow: 0 10px 40px rgba(137,150,255,0.35), 0 0 0 1px rgba(255,255,255,0.25) inset;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .dl-btn::after {
+      content: ""; position: absolute; inset: -3px; border-radius: 21px; z-index: -1;
+      background: linear-gradient(90deg, #8996ff, #f0a8ff, #e5c483, #8996ff);
+      background-size: 300% 100%;
+      filter: blur(14px); opacity: 0.7;
+      animation: vibe-shift 6s linear infinite;
+    }
+    .dl-btn:hover { transform: translateY(-3px) scale(1.02); box-shadow: 0 16px 50px rgba(137,150,255,0.5), 0 0 0 1px rgba(255,255,255,0.35) inset; }
+    .dl-icon { display: inline-flex; width: 40px; height: 40px; }
+    .dl-icon svg { width: 100%; height: 100%; }
+    .dl-text { display: flex; flex-direction: column; line-height: 1.15; }
+    .dl-small { font-size: 12px; font-weight: 600; opacity: 0.7; letter-spacing: 0.3px; }
+    .dl-label { font-size: clamp(19px, 2.2vw, 24px); font-weight: 800; letter-spacing: -0.02em; }
+
+    .dl-others { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--fg-dim); flex-wrap: wrap; justify-content: center; }
+    .dl-others a {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 12px; border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--fg-muted);
+      background: rgba(255,255,255,0.03);
+    }
+    .dl-others a:hover { color: var(--fg); border-color: var(--border-bright); background: rgba(255,255,255,0.08); }
+    .dl-others svg { width: 15px; height: 15px; }
+
+    .vibe-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+    .vibe-chips span {
+      font-family: var(--mono); font-size: 12px; color: var(--fg-muted);
+      padding: 6px 12px; border-radius: 8px;
+      background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+    }
+
+    .vibe-scroll {
+      position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+      font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--fg-dim);
+      animation: vibe-bob 2.2s ease-in-out infinite;
+    }
+    .vibe-scroll:hover { color: var(--fg); }
+    @keyframes vibe-bob { 50% { transform: translate(-50%, 5px); } }
+
+    @media (max-height: 720px) {
+      .vibe-pill { margin-bottom: 16px; }
+      .vibe-title { font-size: clamp(34px, 5vw, 60px); margin-bottom: 14px; }
+      .vibe-lead { margin-bottom: 22px; }
+      .vibe-cta { margin-bottom: 20px; }
+      .vibe-scroll { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .vibe-bg .blob, .vibe-grad, .dl-btn::after, .vibe-pill .dot, .vibe-scroll { animation: none; }
+    }
   </style>
 </head>
 <body>
@@ -1189,67 +1342,55 @@
         <a class="nav-item" href="#protocol">V. Setup Protocol</a>
         <a class="nav-item" href="#inquiries">VI. FAQ</a>
         <button class="btn btn-editorial btn-sm" onclick="openArchModal('00. GitHub Source', 'Official Codebase Repository', 'NovaScript is 100% free and open-source under GPL-3.0. View the C++ bridge and TypeScript browser extension code directly on GitHub.', 'git clone https://github.com/v4ldrix/Nova-Script.git')">GitHub Repo</button>
-        <a class="btn btn-gold btn-sm" href="https://github.com/v4ldrix/Nova-Script" target="_blank" rel="noopener">⬇ Download Edition</a>
+        <a class="btn btn-gold btn-sm" href="#top">⬇ Download</a>
       </div>
     </div>
   </nav>
 
-  <!-- Editorial Hero Section -->
-  <header id="top" class="hero">
-    <div class="wrap">
-      <div class="hero-edition">Monograph No. 04 — Autonomous Game Engine Orchestration</div>
+  <!-- Vibey Download Hero (fits the first screen, no scrolling needed) -->
+  <header id="top" class="hero vibe-hero">
+    <div class="vibe-bg" aria-hidden="true">
+      <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+      <span class="vibe-grid"></span>
+    </div>
 
-      <div class="hero-grid">
-        <div>
-          <h1 class="editorial-headline">
-            Turn any AI chat into an <i>autonomous</i> Roblox Studio agent.
-          </h1>
+    <div class="wrap vibe-inner">
+      <div class="vibe-pill"><span class="dot"></span> Now on Windows, macOS &amp; Linux · 100% free</div>
 
-          <p class="hero-lead">
-            NovaScript connects <strong>DeepSeek, Gemini, ChatGPT, Grok</strong>, and twenty-eight additional intelligence engines directly to Roblox Studio's built-in MCP server. Describe what you wish to create; it reads and edits scripts, executes Luau statements, inspects the game tree, and constructs your place locally—with zero API keys.
-          </p>
+      <h1 class="vibe-title">
+        Vibe-code your Roblox game<br /><span class="vibe-grad">with any AI chat.</span>
+      </h1>
 
-          <div class="hero-actions">
-            <a class="btn btn-gold" href="https://github.com/v4ldrix/Nova-Script" target="_blank" rel="noopener">
-              ⬇ Download for Free (GPL-3.0)
-            </a>
-            <button class="btn btn-editorial" onclick="openArchModal('01. Live Demo Guide', 'Interactive Simulator Instructions', 'In Chapter II below, click any task tab to watch NovaScript stream Luau code edits and JSON-RPC tool calls between your browser and Roblox Studio.', 'studio.run_luau(\"print(\'NovaScript Ready\')\")')">
-              ⚡ Try Interactive Demo
-            </button>
-            <button class="btn btn-editorial" onclick="openArchModal('02. Security & Zero API Keys', 'Local Browser Session Architecture', 'Because NovaScript operates via an open-source browser extension, it utilizes the active chat tab you already have open. Zero tokens or API keys are required.', 'localhost:44100 [MCP Protocol WebSocket]')">
-              🔒 How Zero-Key Works
-            </button>
-          </div>
-        </div>
+      <p class="vibe-lead">
+        NovaScript turns DeepSeek, Gemini, ChatGPT, Grok &amp; 28 more AIs into a Roblox Studio agent that reads scripts, runs Luau and builds your place. No API keys. No terminal.
+      </p>
 
-        <div class="hero-stats-box">
-          <div class="stat-row">
-            <span class="stat-label">01 / Supported Models</span>
-            <span class="stat-val gold">32 Providers</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">02 / Financial Cost</span>
-            <span class="stat-val gold">$0.00 Forever</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">03 / Communication Protocol</span>
-            <span class="stat-val">Official MCP Server</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">04 / Operating Systems</span>
-            <span class="stat-val">Windows &amp; macOS</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">05 / Compatible Browsers</span>
-            <span class="stat-val">Chrome · Edge · Firefox</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">06 / Open-Source License</span>
-            <span class="stat-val gold">GNU GPL-3.0</span>
-          </div>
+      <div class="vibe-cta">
+        <a id="dl-main" class="dl-btn" href="https://github.com/v4ldrix/Nova-Script/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-icon" id="dl-icon" aria-hidden="true"></span>
+          <span class="dl-text">
+            <span class="dl-small">Free download · GPL-3.0</span>
+            <span class="dl-label">Download for <span id="dl-os">your OS</span></span>
+          </span>
+        </a>
+
+        <div class="dl-others" id="dl-others" aria-label="Other platforms">
+          <span>Also on</span>
         </div>
       </div>
+
+      <div class="vibe-chips">
+        <span>32 AI providers</span>
+        <span>$0.00 forever</span>
+        <span>Official Studio MCP</span>
+        <span>Chrome · Edge · Firefox</span>
+      </div>
     </div>
+
+    <a class="vibe-scroll" href="#architecture" aria-label="Scroll to learn more">
+      <span>see how it works</span>
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+    </a>
   </header>
 
   <!-- SECTION I: THE ARCHITECTURE (WORKING NODE BUTTONS!) -->
@@ -1673,6 +1814,10 @@ part.Touched:Connect(<span class="kwd">function</span>(hit)
             <h4>🍎 macOS Edition</h4>
             <p>Runs via terminal shell script (MacOS_Start.command).</p>
           </div>
+          <div class="os-card-btn" id="btn-linux" onclick="switchOS('linux')">
+            <h4>🐧 Linux Edition</h4>
+            <p>Runs via shell script (start.sh) with Python 3.</p>
+          </div>
           <div style="margin-top: 18px; padding: 16px; border: 1px dashed var(--border); font-size: 13px; color: var(--fg-muted);">
             <strong style="color: var(--accent-gold);">100% LOCAL PROCESSING:</strong> All communication happens on <code style="color: #fff;">localhost:44100</code>. No code leaves your computer.
           </div>
@@ -1824,6 +1969,45 @@ part.Touched:Connect(<span class="kwd">function</span>(hit)
 
   <!-- 100% WORKING VANILLA JAVASCRIPT FOR ALL BUTTONS, POPUPS, AND TABS -->
   <script>
+    // OS-aware download button
+    (function () {
+      var RELEASES = 'https://github.com/v4ldrix/Nova-Script/releases/latest';
+      var ICONS = {
+        windows: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.1 10.4 4v7.1H3V5.1zm0 13.8 7.4 1.1v-7H3v5.9zM11.3 3.9 21 2.5v8.6h-9.7V3.9zm0 16.2 9.7 1.4v-8.5h-9.7v7.1z"/></svg>',
+        macos: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.37 12.6c-.02-2.3 1.88-3.4 1.96-3.46-1.07-1.56-2.73-1.78-3.32-1.8-1.41-.14-2.76.83-3.47.83-.72 0-1.82-.81-2.99-.79-1.54.02-2.96.9-3.75 2.27-1.6 2.78-.41 6.89 1.15 9.14.76 1.1 1.67 2.34 2.86 2.3 1.15-.05 1.58-.74 2.97-.74 1.38 0 1.77.74 2.98.72 1.23-.02 2.01-1.12 2.76-2.23.87-1.28 1.23-2.52 1.25-2.58-.03-.01-2.38-.91-2.4-3.66zM14.1 5.85c.63-.77 1.06-1.83.94-2.89-.91.04-2.01.61-2.66 1.37-.58.67-1.09 1.75-.96 2.79 1.02.08 2.05-.52 2.68-1.27z"/></svg>',
+        linux: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.5 2c-2.2 0-3.6 1.8-3.6 4.4 0 1.2.2 2.1-.4 3.2-.7 1.2-2.4 3-2.9 5.3-.3 1.2.1 1.9.1 1.9s-1.3.6-1.6 1.6c-.3 1 .3 1.4 1.1 1.7.9.3 1.9.6 2.6 1.3.8.7 1.9.8 2.6.2.5-.4 1.6-.5 2.6-.4 1.2.1 1.9.6 2.7.4.8-.2 1.2-.9 2.2-1.4 1-.5 2.6-.8 2.8-1.7.2-.9-.9-1.4-1.1-2.1-.2-.7.1-1.9-.6-3-1-1.5-2.2-2.9-2.8-4.3-.6-1.4-.2-2.6-.4-4C16.4 3.6 15 2 12.5 2zm-1.3 3.4c.5 0 .8.6.8 1.3 0 .3-.1.6-.2.8l-.4-.1c.1-.2.1-.4.1-.6 0-.4-.2-.7-.4-.7s-.4.3-.4.7v.2l-.4.2c0-.2-.1-.3-.1-.5 0-.8.4-1.3 1-1.3zm2.6 0c.6 0 1.1.6 1.1 1.4 0 .3-.1.6-.2.8l-.4-.2c.1-.2.1-.4.1-.6 0-.5-.3-.8-.6-.8s-.6.4-.6.8v.3l-.4-.1v-.3c0-.7.4-1.3 1-1.3zm-1.2 2.1c.6 0 1.4.3 1.9.6.3.2.4.4.3.6-.1.2-.3.4-.9.7-.5.3-1 .6-1.6.6s-1-.3-1.3-.6c-.2-.1-.4-.3-.5-.4-.1-.1-.2-.4.1-.6.4-.3 1-.7 1.6-.8.1-.1.3-.1.4-.1zm-2.6 3.4c.8.6 1.7 1 2.7 1 1.1 0 2-.5 2.7-1 .5 1 1.3 2 1.8 3 .4.9.5 1.9.3 2.6-.3-.2-.7-.3-1-.2-.5.1-.7.6-.8 1.2-.1.4-.1.9-.2 1.3-.9.6-2.3.8-3.6.6-.5-.1-1-.2-1.4-.4-.1-.4-.4-.8-.7-1.1-.6-.7-1.3-1.3-1.6-2-.4-.8-.3-1.7.2-2.6.4-.8 1.2-1.6 1.6-2.4z"/></svg>'
+      };
+      var NAMES = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+
+      function detectOS() {
+        var p = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '').toLowerCase();
+        var ua = (navigator.userAgent || '').toLowerCase();
+        if (/win/.test(p) || /windows/.test(ua)) return 'windows';
+        if (/mac|iphone|ipad|ipod/.test(p) || /mac os|iphone|ipad/.test(ua)) return 'macos';
+        if (/linux|x11|cros|android/.test(p) || /linux|x11|cros|android/.test(ua)) return 'linux';
+        return 'windows';
+      }
+
+      var os = detectOS();
+      document.getElementById('dl-icon').innerHTML = ICONS[os];
+      document.getElementById('dl-os').textContent = NAMES[os];
+      document.getElementById('dl-main').setAttribute('aria-label', 'Download NovaScript for ' + NAMES[os]);
+
+      if (typeof switchOS === 'function') switchOS(os === 'windows' ? 'win' : os === 'macos' ? 'mac' : 'linux');
+      else document.addEventListener('DOMContentLoaded', function () { switchOS(os === 'windows' ? 'win' : os === 'macos' ? 'mac' : 'linux'); });
+
+      var others = document.getElementById('dl-others');
+      Object.keys(NAMES).forEach(function (key) {
+        if (key === os) return;
+        var a = document.createElement('a');
+        a.href = RELEASES;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.innerHTML = ICONS[key] + '<span>' + NAMES[key] + '</span>';
+        others.appendChild(a);
+      });
+    })();
+
     // 1. POPUP MODAL SYSTEM (Working for ALL 32 Models, Arch Nodes, and Buttons)
     function openArchModal(title, subtitle, desc, codeSnippet) {
       document.getElementById('modal-tag').innerText = subtitle.toUpperCase();
@@ -2074,12 +2258,17 @@ print("Leaderboard active for: " .. player.Name)`,
     function switchOS(os) {
       document.getElementById('btn-win').classList.remove('active');
       document.getElementById('btn-mac').classList.remove('active');
+      document.getElementById('btn-linux').classList.remove('active');
       document.getElementById('btn-' + os).classList.add('active');
 
       if (os === 'win') {
         document.getElementById('step3-desc').innerHTML =
           'Double-click <code style="color: #fff;">start.bat</code> in your repository folder. Keep the lightweight command window open.';
         document.getElementById('step3-cmd').innerText = './start.bat';
+      } else if (os === 'linux') {
+        document.getElementById('step3-desc').innerHTML =
+          'Run <code style="color: #fff;">start.sh</code> from a terminal (needs Python 3 and the <code style="color: #fff;">websockets</code> package). Keep it running.';
+        document.getElementById('step3-cmd').innerText = 'chmod +x start.sh && ./start.sh';
       } else {
         document.getElementById('step3-desc').innerHTML =
           'Double-click <code style="color: #fff;">MacOS_Start.command</code> (or run it via terminal). Keep the script running.';
